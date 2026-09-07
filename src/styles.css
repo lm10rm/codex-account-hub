@@ -393,16 +393,8 @@ button {
 
 .saved-card-actions {
   display: flex;
-  align-items: flex-end;
-  flex-direction: column;
-  gap: 9px;
-}
-
-.saved-card-meta,
-.switch-actions {
-  display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 9px;
 }
 
 .switch-button {
@@ -432,19 +424,6 @@ button {
   color: #d0c8ff;
   background: rgba(112, 88, 222, 0.12);
   font-size: 10px;
-}
-
-.detail-button {
-  border: 0;
-  padding: 5px 3px;
-  color: #8ca69e;
-  background: transparent;
-  cursor: pointer;
-  font-size: 10px;
-}
-
-.detail-button:hover {
-  color: #73e2c0;
 }
 
 .saved-status {
@@ -481,43 +460,15 @@ button {
   background: rgba(20, 42, 38, 0.58);
 }
 
-.saved-limit-grid span {
+.saved-limit-grid span,
+.saved-limit-grid small {
   color: #78928b;
   font-size: 10px;
 }
 
 .saved-limit-grid strong {
+  grid-row: span 2;
   font-size: 21px;
-}
-
-.saved-detail-panel {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 1px;
-  margin-top: 12px;
-  overflow: hidden;
-  border: 1px solid rgba(164, 221, 204, 0.08);
-  border-radius: 10px;
-  background: rgba(164, 221, 204, 0.08);
-}
-
-.saved-detail-panel > div {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding: 12px 14px;
-  background: #0b1c19;
-}
-
-.saved-detail-panel span {
-  color: #657f78;
-  font-size: 9px;
-}
-
-.saved-detail-panel strong {
-  color: #abc0ba;
-  font-size: 11px;
-  font-weight: 600;
 }
 
 .saved-error {
@@ -583,10 +534,6 @@ button {
     grid-template-columns: 1fr;
   }
 
-  .saved-detail-panel {
-    grid-template-columns: 1fr;
-  }
-
   .saved-account-identity {
     align-items: flex-start;
     gap: 12px;
@@ -597,9 +544,4 @@ button {
     flex-direction: column;
   }
 
-  .saved-card-meta,
-  .switch-actions {
-    flex-wrap: wrap;
-    justify-content: flex-end;
-  }
 }
