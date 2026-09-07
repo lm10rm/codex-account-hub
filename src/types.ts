@@ -33,3 +33,12 @@ export interface SavedAccount {
   planType: string | null;
   importedAt: number;
 }
+
+export interface SwitchOutcome {
+  account: SavedAccount;
+  restartRequested: boolean;
+  restartSucceeded: boolean;
+  codexWasRunning: boolean;
+  processesClosed: number;
+  restartWarning: string | null;
+}

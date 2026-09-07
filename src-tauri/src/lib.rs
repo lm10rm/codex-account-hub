@@ -1,4 +1,5 @@
 mod app_server;
+mod codex_desktop;
 mod runtime;
 mod vault;
 
@@ -10,6 +11,17 @@ use tauri::Manager;
 use tokio::process::Command;
 use tokio::time::timeout;
 use vault::SavedAccount;
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SwitchOutcome {
+    account: SavedAccount,
+    restart_requested: bool,
+    restart_succeeded: bool,
+    codex_was_running: bool,
+    processes_closed: usize,
+    restart_warning: Option<String>,
+}
 
 #[tauri::command]
 fn discover_runtime() -> Result<RuntimeInfo, String> {
@@ -119,7 +131,8 @@ async fn add_account_with_login(
 async fn switch_saved_account(
     app: tauri::AppHandle,
     account_id: String,
-) -> Result<SavedAccount, String> {
+    restart_codex: bool,
+) -> Result<SwitchOutcome, String> {
     let runtime = runtime::discover_runtime()?;
     let data_dir = app
         .path()
@@ -129,10 +142,43 @@ async fn switch_saved_account(
     let current = app_server::query_usage(&runtime.codex_path, &runtime.codex_home).await?;
     vault::import_current(&data_dir, &runtime.codex_home, current.account, None)?;
     vault::activate_account(&data_dir, &account_id, &runtime.codex_home)?;
-    vault::list_accounts(&data_dir)?
+    let account = vault::list_accounts(&data_dir)?
         .into_iter()
         .find(|account| account.id == account_id)
-        .ok_or_else(|| "切换成功，但账号索引中找不到目标账号".to_string())
+        .ok_or_else(|| "切换成功，但账号索引中找不到目标账号".to_string())?;
+
+    if !restart_codex {
+        return Ok(SwitchOutcome {
+            account,
+            restart_requested: false,
+            restart_succeeded: false,
+            codex_was_running: false,
+            processes_closed: 0,
+            restart_warning: None,
+        });
+    }
+
+    let restart_result = tokio::task::spawn_blocking(codex_desktop::restart)
+        .await
+        .map_err(|error| format!("账号已切换，但 Codex 重启任务异常：{error}"))?;
+    match restart_result {
+        Ok(restart) => Ok(SwitchOutcome {
+            account,
+            restart_requested: true,
+            restart_succeeded: true,
+            codex_was_running: restart.was_running,
+            processes_closed: restart.processes_closed,
+            restart_warning: None,
+        }),
+        Err(warning) => Ok(SwitchOutcome {
+            account,
+            restart_requested: true,
+            restart_succeeded: false,
+            codex_was_running: false,
+            processes_closed: 0,
+            restart_warning: Some(warning),
+        }),
+    }
 }
 
 async fn run_interactive_login(

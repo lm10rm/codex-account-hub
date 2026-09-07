@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { LimitWindow, RuntimeInfo, SavedAccount, UsageSnapshot } from "./types";
+import type { LimitWindow, RuntimeInfo, SavedAccount, SwitchOutcome, UsageSnapshot } from "./types";
 
 type LoadState = "idle" | "loading" | "ready" | "error";
 type SavedUsageState = {
@@ -64,6 +64,7 @@ export default function App() {
   const [addingAccount, setAddingAccount] = useState(false);
   const [switchingAccount, setSwitchingAccount] = useState<string | null>(null);
   const [vaultError, setVaultError] = useState<string | null>(null);
+  const [vaultNotice, setVaultNotice] = useState<string | null>(null);
 
   const refreshSavedAccounts = useCallback(async (accounts: SavedAccount[]) => {
     if (!accounts.length || vaultRefreshInFlight.current) return;
@@ -131,6 +132,7 @@ export default function App() {
   const importCurrent = useCallback(async () => {
     setImporting(true);
     setVaultError(null);
+    setVaultNotice(null);
     try {
       const saved = await invoke<SavedAccount>("import_current_account", { label: null });
       setSavedAccounts((accounts) => {
@@ -148,6 +150,7 @@ export default function App() {
   const addAccount = useCallback(async () => {
     setAddingAccount(true);
     setVaultError(null);
+    setVaultNotice(null);
     try {
       const saved = await invoke<SavedAccount>("add_account_with_login", { label: null });
       setSavedAccounts((accounts) => {
@@ -163,15 +166,28 @@ export default function App() {
   }, [refreshSavedAccounts]);
 
   const switchAccount = useCallback(
-    async (account: SavedAccount) => {
+    async (account: SavedAccount, restartCodex: boolean) => {
       const confirmed = window.confirm(
-        `切换到 ${account.label}？\n\n应用会先加密保存当前账号，再替换本机 Codex 登录。正在运行的任务可能继续使用旧会话，切换后建议重启 Codex。`,
+        restartCodex
+          ? `切换到 ${account.label} 并重启 Codex？\n\n应用会先加密保存当前账号，再替换本机登录。所有正在运行的 Codex 任务和窗口都会被关闭。`
+          : `仅切换到 ${account.label}？\n\n应用会替换本机 Codex 登录，但不会关闭当前 Codex。你需要稍后手动重启 Codex 才能确保生效。`,
       );
       if (!confirmed) return;
       setSwitchingAccount(account.id);
       setVaultError(null);
+      setVaultNotice(null);
       try {
-        await invoke<SavedAccount>("switch_saved_account", { accountId: account.id });
+        const outcome = await invoke<SwitchOutcome>("switch_saved_account", {
+          accountId: account.id,
+          restartCodex,
+        });
+        if (outcome.restartWarning) {
+          setVaultError(outcome.restartWarning);
+        } else if (outcome.restartSucceeded) {
+          setVaultNotice(`已切换到 ${outcome.account.label}，Codex 已重新启动。`);
+        } else {
+          setVaultNotice(`已切换到 ${outcome.account.label}，请稍后手动重启 Codex。`);
+        }
         await refresh();
       } catch (reason) {
         setVaultError(reason instanceof Error ? reason.message : String(reason));
@@ -269,6 +285,7 @@ export default function App() {
               : "将当前登录加密保存后，才能继续录入和管理其他账号。"}
           </p>
           {addingAccount && <p className="login-hint">请在刚打开的官方页面完成登录，当前 Codex 账号不会被切换。</p>}
+          {vaultNotice && <p className="vault-notice">{vaultNotice}</p>}
           {vaultError && <p className="vault-error">{vaultError}</p>}
         </div>
         <div className="vault-actions">
@@ -326,10 +343,17 @@ export default function App() {
                       </span>
                       <button
                         className="switch-button"
-                        onClick={() => void switchAccount(account)}
+                        onClick={() => void switchAccount(account, true)}
                         disabled={switchingAccount !== null || addingAccount || importing}
                       >
-                        {switchingAccount === account.id ? "正在切换…" : "切换到此账号"}
+                        {switchingAccount === account.id ? "正在切换…" : "切换并重启"}
+                      </button>
+                      <button
+                        className="switch-button subtle"
+                        onClick={() => void switchAccount(account, false)}
+                        disabled={switchingAccount !== null || addingAccount || importing}
+                      >
+                        仅切换
                       </button>
                     </div>
                   </div>

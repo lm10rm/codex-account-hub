@@ -334,6 +334,10 @@ button {
   color: #6bdcbb;
 }
 
+.coming-next .vault-notice {
+  color: #75e5c2;
+}
+
 .coming-next .vault-error {
   color: #e7a29a;
 }
@@ -408,6 +412,12 @@ button {
 .switch-button:disabled {
   opacity: 0.55;
   cursor: wait;
+}
+
+.switch-button.subtle {
+  border-color: rgba(146, 158, 154, 0.14);
+  color: #91aaa3;
+  background: transparent;
 }
 
 .saved-status {
