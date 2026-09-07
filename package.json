@@ -1,0 +1,33 @@
+{
+  "name": "codex-account-hub",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local-first Codex account usage dashboard and safe account switcher.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "tauri": "tauri",
+    "desktop:dev": "tauri dev",
+    "desktop:build": "tauri build",
+    "probe": "node scripts/probe-app-server.mjs",
+    "test": "node --test",
+    "check": "node --check scripts/probe-app-server.mjs && node --check src/core/app-server-client.mjs && node --check src/core/codex-discovery.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.8.0",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.8.4",
+    "@types/react": "^19.1.12",
+    "@types/react-dom": "^19.1.9",
+    "@vitejs/plugin-react": "^5.0.4",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.7"
+  }
+}

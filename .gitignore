@@ -1,0 +1,25 @@
+node_modules/
+.npm-cache/
+dist/
+target/
+.vite/
+coverage/
+*.log
+
+# Local runtime data and credentials
+.data/
+.runtime/
+auth.json
+*.auth.json
+accounts.json
+*.dpapi
+vault/
+runtime/
+login/
+switch-backups/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
