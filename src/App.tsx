@@ -65,6 +65,7 @@ export default function App() {
   const [switchingAccount, setSwitchingAccount] = useState<string | null>(null);
   const [vaultError, setVaultError] = useState<string | null>(null);
   const [vaultNotice, setVaultNotice] = useState<string | null>(null);
+  const [expandedAccounts, setExpandedAccounts] = useState<Set<string>>(() => new Set());
 
   const refreshSavedAccounts = useCallback(async (accounts: SavedAccount[]) => {
     if (!accounts.length || vaultRefreshInFlight.current) return;
@@ -198,6 +199,15 @@ export default function App() {
     [refresh],
   );
 
+  const toggleAccountDetails = useCallback((accountId: string) => {
+    setExpandedAccounts((previous) => {
+      const next = new Set(previous);
+      if (next.has(accountId)) next.delete(accountId);
+      else next.add(accountId);
+      return next;
+    });
+  }, []);
+
   useEffect(() => {
     void refresh();
   }, [refresh]);
@@ -324,6 +334,7 @@ export default function App() {
           <div className="saved-account-list">
             {savedAccounts.map((account) => {
               const usage = savedUsage[account.id];
+              const isExpanded = expandedAccounts.has(account.id);
               return (
                 <article className="saved-account-card" key={account.id}>
                   <div className="saved-account-identity">
@@ -332,29 +343,41 @@ export default function App() {
                       <span>{account.planType?.toUpperCase() ?? "UNKNOWN PLAN"}</span>
                     </div>
                     <div className="saved-card-actions">
-                      <span className={`saved-status ${usage?.state ?? "idle"}`}>
-                        {usage?.state === "loading"
-                          ? "刷新中"
-                          : usage?.state === "error"
-                            ? "读取失败"
-                            : usage?.state === "ready"
-                              ? "已同步"
-                              : "等待刷新"}
-                      </span>
-                      <button
-                        className="switch-button"
-                        onClick={() => void switchAccount(account, true)}
-                        disabled={switchingAccount !== null || addingAccount || importing}
-                      >
-                        {switchingAccount === account.id ? "正在切换…" : "切换并重启"}
-                      </button>
-                      <button
-                        className="switch-button subtle"
-                        onClick={() => void switchAccount(account, false)}
-                        disabled={switchingAccount !== null || addingAccount || importing}
-                      >
-                        仅切换
-                      </button>
+                      <div className="saved-card-meta">
+                        <span className={`saved-status ${usage?.state ?? "idle"}`}>
+                          {usage?.state === "loading"
+                            ? "刷新中"
+                            : usage?.state === "error"
+                              ? "读取失败"
+                              : usage?.state === "ready"
+                                ? "已同步"
+                                : "等待刷新"}
+                        </span>
+                        <span className="credit-badge">重置券 {usage?.snapshot?.resetCreditsAvailable ?? "—"}</span>
+                        <button
+                          className="detail-button"
+                          aria-expanded={isExpanded}
+                          onClick={() => toggleAccountDetails(account.id)}
+                        >
+                          {isExpanded ? "收起详情 ︿" : "查看详情 ﹀"}
+                        </button>
+                      </div>
+                      <div className="switch-actions">
+                        <button
+                          className="switch-button"
+                          onClick={() => void switchAccount(account, true)}
+                          disabled={switchingAccount !== null || addingAccount || importing}
+                        >
+                          {switchingAccount === account.id ? "正在切换…" : "切换并重启"}
+                        </button>
+                        <button
+                          className="switch-button subtle"
+                          onClick={() => void switchAccount(account, false)}
+                          disabled={switchingAccount !== null || addingAccount || importing}
+                        >
+                          仅切换
+                        </button>
+                      </div>
                     </div>
                   </div>
                   {usage?.error ? (
@@ -364,12 +387,26 @@ export default function App() {
                       <div>
                         <span>{formatWindow(usage?.snapshot?.primary?.windowDurationMins ?? null)}</span>
                         <strong>{usage?.snapshot?.primary?.remainingPercent ?? "—"}%</strong>
-                        <small>{formatResetTime(usage?.snapshot?.primary?.resetsAt ?? null)} 重置</small>
                       </div>
                       <div>
                         <span>{formatWindow(usage?.snapshot?.secondary?.windowDurationMins ?? null)}</span>
                         <strong>{usage?.snapshot?.secondary?.remainingPercent ?? "—"}%</strong>
-                        <small>{formatResetTime(usage?.snapshot?.secondary?.resetsAt ?? null)} 重置</small>
+                      </div>
+                    </div>
+                  )}
+                  {isExpanded && usage?.snapshot && (
+                    <div className="saved-detail-panel">
+                      <div>
+                        <span>{formatWindow(usage.snapshot.primary?.windowDurationMins ?? null)}重置</span>
+                        <strong>{formatResetTime(usage.snapshot.primary?.resetsAt ?? null)}</strong>
+                      </div>
+                      <div>
+                        <span>{formatWindow(usage.snapshot.secondary?.windowDurationMins ?? null)}重置</span>
+                        <strong>{formatResetTime(usage.snapshot.secondary?.resetsAt ?? null)}</strong>
+                      </div>
+                      <div>
+                        <span>数据采集时间</span>
+                        <strong>{formatResetTime(usage.snapshot.capturedAt)}</strong>
                       </div>
                     </div>
                   )}
@@ -380,10 +417,6 @@ export default function App() {
         </section>
       )}
 
-      <footer className="app-footer">
-        <span>{runtime?.codexHome ?? "正在发现 Codex Home…"}</span>
-        <span>不会显示或记录 OAuth token</span>
-      </footer>
     </main>
   );
 }

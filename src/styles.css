@@ -36,7 +36,6 @@ button {
 .account-header,
 .account-footer,
 .coming-next,
-.app-footer,
 .identity-row,
 .meter-heading,
 .meter-foot {
@@ -263,8 +262,7 @@ button {
 .meter-label,
 .reset-time,
 .meter-foot,
-.account-footer,
-.app-footer {
+.account-footer {
   color: #78928b;
   font-size: 11px;
 }
@@ -395,8 +393,16 @@ button {
 
 .saved-card-actions {
   display: flex;
-  align-items: center;
+  align-items: flex-end;
+  flex-direction: column;
   gap: 9px;
+}
+
+.saved-card-meta,
+.switch-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .switch-button {
@@ -418,6 +424,27 @@ button {
   border-color: rgba(146, 158, 154, 0.14);
   color: #91aaa3;
   background: transparent;
+}
+
+.credit-badge {
+  border-radius: 999px;
+  padding: 5px 9px;
+  color: #d0c8ff;
+  background: rgba(112, 88, 222, 0.12);
+  font-size: 10px;
+}
+
+.detail-button {
+  border: 0;
+  padding: 5px 3px;
+  color: #8ca69e;
+  background: transparent;
+  cursor: pointer;
+  font-size: 10px;
+}
+
+.detail-button:hover {
+  color: #73e2c0;
 }
 
 .saved-status {
@@ -454,25 +481,48 @@ button {
   background: rgba(20, 42, 38, 0.58);
 }
 
-.saved-limit-grid span,
-.saved-limit-grid small {
+.saved-limit-grid span {
   color: #78928b;
   font-size: 10px;
 }
 
 .saved-limit-grid strong {
-  grid-row: span 2;
   font-size: 21px;
+}
+
+.saved-detail-panel {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1px;
+  margin-top: 12px;
+  overflow: hidden;
+  border: 1px solid rgba(164, 221, 204, 0.08);
+  border-radius: 10px;
+  background: rgba(164, 221, 204, 0.08);
+}
+
+.saved-detail-panel > div {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 14px;
+  background: #0b1c19;
+}
+
+.saved-detail-panel span {
+  color: #657f78;
+  font-size: 9px;
+}
+
+.saved-detail-panel strong {
+  color: #abc0ba;
+  font-size: 11px;
+  font-weight: 600;
 }
 
 .saved-error {
   margin: 14px 0 0;
   font-size: 11px;
-}
-
-.app-footer {
-  justify-content: space-between;
-  padding: 20px 4px 0;
 }
 
 .error-card {
@@ -509,7 +559,7 @@ button {
   .account-header,
   .account-footer,
   .coming-next,
-  .app-footer {
+  .saved-account-identity {
     align-items: flex-start;
     flex-direction: column;
   }
@@ -533,6 +583,10 @@ button {
     grid-template-columns: 1fr;
   }
 
+  .saved-detail-panel {
+    grid-template-columns: 1fr;
+  }
+
   .saved-account-identity {
     align-items: flex-start;
     gap: 12px;
@@ -541,5 +595,11 @@ button {
   .saved-card-actions {
     align-items: flex-end;
     flex-direction: column;
+  }
+
+  .saved-card-meta,
+  .switch-actions {
+    flex-wrap: wrap;
+    justify-content: flex-end;
   }
 }

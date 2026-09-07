@@ -1,6 +1,6 @@
 [package]
 name = "codex-account-hub"
-version = "0.1.1"
+version = "0.1.2"
 description = "Local-first Codex account usage dashboard and switcher"
 authors = ["Codex Account Hub contributors"]
 edition = "2024"
