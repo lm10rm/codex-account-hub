@@ -45,7 +45,7 @@ src-tauri/target/release/codex-account-hub.exe
 构建同时生成独立可执行文件和当前用户模式的 NSIS 安装包：
 
 ```text
-src-tauri/target/release/bundle/nsis/Codex Account Hub_0.1.0_x64-setup.exe
+src-tauri/target/release/bundle/nsis/Codex Account Hub_0.1.1_x64-setup.exe
 ```
 
 安装后可从桌面快捷方式或开始菜单直接启动，不会显示 CMD 窗口，也不需要管理员权限。
