@@ -12,6 +12,7 @@ coverage/
 auth.json
 *.auth.json
 accounts.json
+usage-cache.json
 *.dpapi
 vault/
 runtime/

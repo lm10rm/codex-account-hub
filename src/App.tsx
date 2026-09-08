@@ -50,7 +50,7 @@ function formatRelativeTime(timestamp: number | null, now: number) {
 
 function formatCapturedAt(timestamp: number | null) {
   if (!timestamp) return "尚未同步";
-  return new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit" }).format(
+  return new Intl.DateTimeFormat("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(
     new Date(timestamp * 1_000),
   );
 }
@@ -138,6 +138,7 @@ export default function App() {
   const [savedAccounts, setSavedAccounts] = useState<SavedAccount[]>([]);
   const [savedUsage, setSavedUsage] = useState<Record<string, SavedUsageState>>({});
   const [refreshingVault, setRefreshingVault] = useState(false);
+  const cacheHydrated = useRef(false);
   const fullRefreshInFlight = useRef(false);
   const vaultRefreshInFlight = useRef(false);
   const [importing, setImporting] = useState(false);
@@ -201,6 +202,10 @@ export default function App() {
     fullRefreshInFlight.current = true;
     setState("loading");
     setError(null);
+    const cachedUsage = cacheHydrated.current
+      ? Promise.resolve<Record<string, UsageSnapshot> | null>(null)
+      : invoke<Record<string, UsageSnapshot>>("load_usage_cache").catch(() => null);
+    cacheHydrated.current = true;
     const runtimeAndUsage = Promise.allSettled([
       invoke<RuntimeInfo>("discover_runtime"),
       invoke<UsageSnapshot>("query_current_usage"),
@@ -212,6 +217,25 @@ export default function App() {
         const accounts = await invoke<SavedAccount[]>("list_saved_accounts");
         savedResult = { status: "fulfilled", value: accounts };
         setSavedAccounts(accounts);
+        const cached = await cachedUsage;
+        if (cached) {
+          setSavedUsage((previous) => {
+            const next = { ...previous };
+            for (const account of accounts) {
+              const cachedSnapshot = cached[account.id];
+              const current = previous[account.id];
+              if (cachedSnapshot && (!current?.snapshot || cachedSnapshot.capturedAt > current.snapshot.capturedAt)) {
+                next[account.id] = { state: "ready", snapshot: cachedSnapshot, error: null };
+              }
+            }
+            return next;
+          });
+          const active = accounts.find((account) => account.isActive);
+          const activeSnapshot = active ? cached[active.id] : null;
+          if (activeSnapshot) {
+            setSnapshot((current) => !current || activeSnapshot.capturedAt > current.capturedAt ? activeSnapshot : current);
+          }
+        }
         savedRefresh = refreshSavedAccounts(accounts.filter((account) => !account.isActive));
       } catch (reason) {
         savedResult = { status: "rejected", reason };
@@ -226,6 +250,27 @@ export default function App() {
       setError(failures.length ? failures.join("；") : null);
       setState(usageResult.status === "fulfilled" ? "ready" : "error");
       await savedRefresh;
+    } finally {
+      fullRefreshInFlight.current = false;
+    }
+  }, [refreshSavedAccounts]);
+
+  const refreshAccount = useCallback(async (account: SavedAccount) => {
+    if (!account.isActive) {
+      await refreshSavedAccounts([account]);
+      return;
+    }
+    if (fullRefreshInFlight.current || vaultRefreshInFlight.current) return;
+    fullRefreshInFlight.current = true;
+    setState("loading");
+    setError(null);
+    try {
+      const usage = await invoke<UsageSnapshot>("query_current_usage");
+      setSnapshot(usage);
+      setState("ready");
+    } catch (reason) {
+      setError(errorText(reason));
+      setState("error");
     } finally {
       fullRefreshInFlight.current = false;
     }
@@ -385,7 +430,7 @@ export default function App() {
                       <div className="menu-wrap" onClick={(event) => event.stopPropagation()}>
                         <button className="icon-button menu-trigger" aria-label={`${account.label} 更多操作`} aria-expanded={openMenu === account.id} onClick={() => setOpenMenu((value) => value === account.id ? null : account.id)} disabled={operationBusy}>•••</button>
                         {openMenu === account.id && <div className="account-menu">
-                          <button onClick={() => { setOpenMenu(null); void refreshSavedAccounts([account]); }}>↻<span>刷新额度</span></button>
+                          <button onClick={() => { setOpenMenu(null); void refreshAccount(account); }}>↻<span>刷新额度</span></button>
                           {!account.isActive && <button onClick={() => { setOpenMenu(null); setDialog({ type: "switch", account, restartCodex: false }); }}>⇄<span>仅切换账号</span></button>}
                           <button onClick={() => { setOpenMenu(null); setRenameValue(account.label); setDialog({ type: "rename", account }); }}>✎<span>重命名</span></button>
                           <button onClick={() => void reauthorizeAccount(account)}>↗<span>重新授权</span></button>
@@ -394,7 +439,7 @@ export default function App() {
                       </div>
                     </div>
                   </div>
-                  {usage.error && <p className="account-error" title={usage.error}>刷新失败，正在显示上次成功数据：{usage.error}</p>}
+                  {usage.error && <div className="account-error"><span title={usage.error}>{usage.snapshot ? "刷新失败，正在显示上次成功数据" : "刷新失败"}：{usage.error}</span><button onClick={() => void refreshAccount(account)} disabled={state === "loading" || refreshingVault}>重试</button></div>}
                   <div className={`quota-grid ${usage.state === "loading" && !usage.snapshot ? "loading" : ""}`}>
                     <QuotaBlock window={usage.snapshot?.primary ?? null} tone="primary" now={now} />
                     <QuotaBlock window={usage.snapshot?.secondary ?? null} tone="secondary" now={now} />

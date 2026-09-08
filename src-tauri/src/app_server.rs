@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -8,7 +8,7 @@ use tokio::time::{Duration, timeout};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageSnapshot {
     pub account: Option<AccountInfo>,
@@ -19,7 +19,7 @@ pub struct UsageSnapshot {
     pub captured_at: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountInfo {
     pub account_type: Option<String>,
@@ -27,7 +27,7 @@ pub struct AccountInfo {
     pub plan_type: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LimitWindow {
     pub used_percent: Option<f64>,
@@ -85,7 +85,7 @@ impl AppServerProcess {
                 "clientInfo": {
                     "name": "codex_account_hub",
                     "title": "Codex Account Hub",
-                    "version": "0.1.0"
+                    "version": env!("CARGO_PKG_VERSION")
                 },
                 "capabilities": {}
             }

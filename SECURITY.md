@@ -7,6 +7,7 @@ Codex Account Hub 管理可用于登录 Codex 的 OAuth 凭据。请把应用数
 - 账号密码始终由官方 Codex 登录流程处理，本应用不会接收或保存密码。
 - 完整认证载荷使用 Windows DPAPI 加密，并绑定到当前 Windows 用户。
 - 非敏感索引只保存别名、套餐和不可逆的账号标识哈希。
+- 额度缓存只保存脱敏账号信息、额度比例、重置时间和采集时间，不包含 OAuth token。
 - 额度读取由本机官方 Codex App Server 完成。
 - 前端不提供 token 查看、复制、导出或上传能力。
 - 所有认证相关 Tauri commands 使用显式参数，不提供任意文件读取或任意命令执行入口。
@@ -41,6 +42,7 @@ Codex Account Hub 管理可用于登录 Codex 的 OAuth 凭据。请把应用数
 
 ```text
 accounts.json
+usage-cache.json
 auth.json
 *.dpapi
 vault/

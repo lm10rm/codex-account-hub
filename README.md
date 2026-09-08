@@ -12,6 +12,7 @@
 - 通过官方 Codex 登录页面添加或重新授权账号。
 - 一键切换账号并重新启动 Codex，也可选择仅切换。
 - 支持账号重命名、单独刷新和删除。
+- 启动时立即展示上次成功额度，再在后台更新实时数据。
 - 支持浅色与深色主题。
 - 关闭窗口后驻留系统托盘，可从托盘刷新或重新打开；重复启动只会唤醒已有窗口。
 - 使用 Windows DPAPI 加密保存认证信息。
@@ -21,7 +22,7 @@
 前往 [GitHub Releases](https://github.com/lm10rm/codex-account-hub/releases/latest) 下载最新的 Windows x64 安装包：
 
 ```text
-Codex Account Hub_0.3.0_x64-setup.exe
+Codex Account Hub_0.4.0_x64-setup.exe
 ```
 
 安装包使用当前用户模式，不需要管理员权限。安装后可从桌面快捷方式或开始菜单启动，不会打开额外的终端窗口。
@@ -53,7 +54,7 @@ Codex Account Hub_0.3.0_x64-setup.exe
 ## 当前限制
 
 - 仅支持 Windows x64。
-- 额度缓存目前只在本次应用运行期间保留。
+- 每个账号目前只保留最近一次成功额度，不提供历史趋势图。
 - 尚未提供开机启动和自动更新。
 - 安装包尚未进行代码签名。
 - Codex 桌面端或 App Server 协议升级后，可能需要同步适配。

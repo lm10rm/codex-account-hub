@@ -1,6 +1,7 @@
 mod app_server;
 mod codex_desktop;
 mod runtime;
+mod usage_cache;
 mod vault;
 
 use app_server::UsageSnapshot;
@@ -11,6 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager};
 use tokio::process::Command;
 use tokio::time::timeout;
+use usage_cache::UsageCache;
 use vault::SavedAccount;
 
 const MAX_CONCURRENT_USAGE_QUERIES: usize = 3;
@@ -71,7 +73,9 @@ fn update_tray_current_account(app: tauri::AppHandle, label: Option<String>) -> 
 
 #[tauri::command]
 async fn query_current_usage(
+    app: tauri::AppHandle,
     operation_state: tauri::State<'_, OperationState>,
+    usage_cache: tauri::State<'_, UsageCache>,
 ) -> Result<UsageSnapshot, String> {
     let _guard = operation_state.gate.read().await;
     let _query_slot = operation_state
@@ -80,7 +84,23 @@ async fn query_current_usage(
         .await
         .map_err(|_| "额度查询队列已关闭".to_string())?;
     let runtime = runtime::discover_runtime()?;
-    app_server::query_usage(&runtime.codex_path, &runtime.codex_home).await
+    let account_id = vault::current_account_id(&runtime.codex_home).ok();
+    let snapshot = app_server::query_usage(&runtime.codex_path, &runtime.codex_home).await?;
+    if let Some(account_id) = account_id {
+        if let Ok(data_dir) = app.path().app_data_dir() {
+            let _ = usage_cache
+                .store(&data_dir, account_id, snapshot.clone())
+                .await;
+        }
+    }
+    Ok(snapshot)
+}
+
+#[tauri::command]
+async fn load_usage_cache(
+    usage_cache: tauri::State<'_, UsageCache>,
+) -> Result<std::collections::HashMap<String, UsageSnapshot>, String> {
+    Ok(usage_cache.all().await)
 }
 
 #[tauri::command]
@@ -125,6 +145,7 @@ async fn import_current_account(
 async fn query_saved_usage(
     app: tauri::AppHandle,
     operation_state: tauri::State<'_, OperationState>,
+    usage_cache: tauri::State<'_, UsageCache>,
     account_id: String,
 ) -> Result<UsageSnapshot, String> {
     let _guard = operation_state.gate.read().await;
@@ -148,14 +169,18 @@ async fn query_saved_usage(
     .await;
     let cleanup_result = vault::finish_isolated_home(&data_dir, &account_id, &isolated_home);
 
-    match (query_result, cleanup_result) {
+    let snapshot = match (query_result, cleanup_result) {
         (Ok(snapshot), Ok(())) => Ok(snapshot),
         (Err(query_error), Ok(())) => Err(query_error),
         (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
         (Err(query_error), Err(cleanup_error)) => Err(format!(
             "{query_error}；同时清理隔离认证状态失败：{cleanup_error}"
         )),
-    }
+    }?;
+    let _ = usage_cache
+        .store(&data_dir, account_id, snapshot.clone())
+        .await;
+    Ok(snapshot)
 }
 
 #[tauri::command]
@@ -254,6 +279,7 @@ async fn rename_saved_account(
 async fn delete_saved_account(
     app: tauri::AppHandle,
     operation_state: tauri::State<'_, OperationState>,
+    usage_cache: tauri::State<'_, UsageCache>,
     account_id: String,
 ) -> Result<(), String> {
     let _guard = operation_state.gate.write().await;
@@ -263,7 +289,9 @@ async fn delete_saved_account(
         .app_data_dir()
         .map_err(|error| error.to_string())?;
     let current_id = vault::current_account_id(&runtime.codex_home)?;
-    vault::delete_account(&data_dir, &account_id, Some(&current_id))
+    vault::delete_account(&data_dir, &account_id, Some(&current_id))?;
+    let _ = usage_cache.remove(&data_dir, &account_id).await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -488,6 +516,7 @@ pub fn run() {
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             vault::cleanup_stale_login_auth(&data_dir).map_err(std::io::Error::other)?;
+            app.manage(UsageCache::load(&data_dir));
             setup_tray(app)?;
             Ok(())
         })
@@ -504,6 +533,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             discover_runtime,
             update_tray_current_account,
+            load_usage_cache,
             query_current_usage,
             list_saved_accounts,
             import_current_account,
