@@ -206,7 +206,10 @@ export default function App() {
     if (usageResult.status === "fulfilled") setSnapshot(usageResult.value);
     if (savedResult.status === "fulfilled") {
       setSavedAccounts(savedResult.value);
-      void refreshSavedAccounts(savedResult.value);
+      const accountsToRefresh = usageResult.status === "fulfilled"
+        ? savedResult.value.filter((account) => !account.isActive)
+        : savedResult.value;
+      void refreshSavedAccounts(accountsToRefresh);
     }
     const failures = [runtimeResult, usageResult, savedResult]
       .filter((result): result is PromiseRejectedResult => result.status === "rejected")

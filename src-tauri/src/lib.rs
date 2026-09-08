@@ -12,8 +12,19 @@ use tokio::process::Command;
 use tokio::time::timeout;
 use vault::SavedAccount;
 
-#[derive(Default)]
-struct OperationLock(tokio::sync::Mutex<()>);
+struct OperationState {
+    gate: tokio::sync::RwLock<()>,
+    query_slots: tokio::sync::Semaphore,
+}
+
+impl Default for OperationState {
+    fn default() -> Self {
+        Self {
+            gate: tokio::sync::RwLock::new(()),
+            query_slots: tokio::sync::Semaphore::new(2),
+        }
+    }
+}
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -33,9 +44,14 @@ fn discover_runtime() -> Result<RuntimeInfo, String> {
 
 #[tauri::command]
 async fn query_current_usage(
-    operation_lock: tauri::State<'_, OperationLock>,
+    operation_state: tauri::State<'_, OperationState>,
 ) -> Result<UsageSnapshot, String> {
-    let _guard = operation_lock.0.lock().await;
+    let _guard = operation_state.gate.read().await;
+    let _query_slot = operation_state
+        .query_slots
+        .acquire()
+        .await
+        .map_err(|_| "额度查询队列已关闭".to_string())?;
     let runtime = runtime::discover_runtime()?;
     app_server::query_usage(&runtime.codex_path, &runtime.codex_home).await
 }
@@ -43,9 +59,9 @@ async fn query_current_usage(
 #[tauri::command]
 async fn list_saved_accounts(
     app: tauri::AppHandle,
-    operation_lock: tauri::State<'_, OperationLock>,
+    operation_state: tauri::State<'_, OperationState>,
 ) -> Result<Vec<SavedAccount>, String> {
-    let _guard = operation_lock.0.lock().await;
+    let _guard = operation_state.gate.read().await;
     let runtime = runtime::discover_runtime()?;
     let data_dir = app
         .path()
@@ -62,10 +78,10 @@ async fn list_saved_accounts(
 #[tauri::command]
 async fn import_current_account(
     app: tauri::AppHandle,
-    operation_lock: tauri::State<'_, OperationLock>,
+    operation_state: tauri::State<'_, OperationState>,
     label: Option<String>,
 ) -> Result<SavedAccount, String> {
-    let _guard = operation_lock.0.lock().await;
+    let _guard = operation_state.gate.write().await;
     let runtime = runtime::discover_runtime()?;
     let account = app_server::query_usage(&runtime.codex_path, &runtime.codex_home)
         .await
@@ -81,10 +97,15 @@ async fn import_current_account(
 #[tauri::command]
 async fn query_saved_usage(
     app: tauri::AppHandle,
-    operation_lock: tauri::State<'_, OperationLock>,
+    operation_state: tauri::State<'_, OperationState>,
     account_id: String,
 ) -> Result<UsageSnapshot, String> {
-    let _guard = operation_lock.0.lock().await;
+    let _guard = operation_state.gate.read().await;
+    let _query_slot = operation_state
+        .query_slots
+        .acquire()
+        .await
+        .map_err(|_| "额度查询队列已关闭".to_string())?;
     let runtime = runtime::discover_runtime()?;
     let data_dir = app
         .path()
@@ -113,10 +134,10 @@ async fn query_saved_usage(
 #[tauri::command]
 async fn add_account_with_login(
     app: tauri::AppHandle,
-    operation_lock: tauri::State<'_, OperationLock>,
+    operation_state: tauri::State<'_, OperationState>,
     label: Option<String>,
 ) -> Result<SavedAccount, String> {
-    let _guard = operation_lock.0.lock().await;
+    let _guard = operation_state.gate.write().await;
     let runtime = runtime::discover_runtime()?;
     let data_dir = app
         .path()
@@ -150,10 +171,10 @@ async fn add_account_with_login(
 #[tauri::command]
 async fn reauthorize_account(
     app: tauri::AppHandle,
-    operation_lock: tauri::State<'_, OperationLock>,
+    operation_state: tauri::State<'_, OperationState>,
     account_id: String,
 ) -> Result<SavedAccount, String> {
-    let _guard = operation_lock.0.lock().await;
+    let _guard = operation_state.gate.write().await;
     let runtime = runtime::discover_runtime()?;
     let data_dir = app
         .path()
@@ -190,11 +211,11 @@ async fn reauthorize_account(
 #[tauri::command]
 async fn rename_saved_account(
     app: tauri::AppHandle,
-    operation_lock: tauri::State<'_, OperationLock>,
+    operation_state: tauri::State<'_, OperationState>,
     account_id: String,
     label: String,
 ) -> Result<SavedAccount, String> {
-    let _guard = operation_lock.0.lock().await;
+    let _guard = operation_state.gate.write().await;
     let data_dir = app
         .path()
         .app_data_dir()
@@ -205,10 +226,10 @@ async fn rename_saved_account(
 #[tauri::command]
 async fn delete_saved_account(
     app: tauri::AppHandle,
-    operation_lock: tauri::State<'_, OperationLock>,
+    operation_state: tauri::State<'_, OperationState>,
     account_id: String,
 ) -> Result<(), String> {
-    let _guard = operation_lock.0.lock().await;
+    let _guard = operation_state.gate.write().await;
     let runtime = runtime::discover_runtime()?;
     let data_dir = app
         .path()
@@ -221,11 +242,11 @@ async fn delete_saved_account(
 #[tauri::command]
 async fn switch_saved_account(
     app: tauri::AppHandle,
-    operation_lock: tauri::State<'_, OperationLock>,
+    operation_state: tauri::State<'_, OperationState>,
     account_id: String,
     restart_codex: bool,
 ) -> Result<SwitchOutcome, String> {
-    let _guard = operation_lock.0.lock().await;
+    let _guard = operation_state.gate.write().await;
     let runtime = runtime::discover_runtime()?;
     let data_dir = app
         .path()
@@ -351,7 +372,7 @@ impl LoginCommandWindowsExt for Command {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .manage(OperationLock::default())
+        .manage(OperationState::default())
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             vault::cleanup_stale_login_auth(&data_dir).map_err(std::io::Error::other)?;
