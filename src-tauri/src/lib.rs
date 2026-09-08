@@ -48,6 +48,60 @@ struct SwitchOutcome {
     restart_warning: Option<String>,
 }
 
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UsageQueryError {
+    code: &'static str,
+    message: String,
+    reauth_required: bool,
+}
+
+impl From<String> for UsageQueryError {
+    fn from(message: String) -> Self {
+        let normalized = message.to_lowercase();
+        let (code, reauth_required) = if [
+            "unauthorized",
+            "not logged in",
+            "authentication",
+            "token expired",
+            "access token",
+            "登录失效",
+            "未登录",
+            "认证",
+            "401",
+        ]
+        .iter()
+        .any(|keyword| normalized.contains(keyword))
+        {
+            ("authentication_required", true)
+        } else if normalized.contains("超时") || normalized.contains("timeout") {
+            ("timeout", false)
+        } else if normalized.contains("未找到 codex") || normalized.contains("无法确定 codex home")
+        {
+            ("runtime_unavailable", false)
+        } else if ["network", "connection", "connect", "dns", "网络", "连接"]
+            .iter()
+            .any(|keyword| normalized.contains(keyword))
+        {
+            ("network", false)
+        } else if normalized.contains("app server") {
+            ("app_server", false)
+        } else if ["文件", "目录", "dpapi", "加密账号", "清理隔离"]
+            .iter()
+            .any(|keyword| normalized.contains(keyword))
+        {
+            ("local_io", false)
+        } else {
+            ("unknown", false)
+        };
+        Self {
+            code,
+            message,
+            reauth_required,
+        }
+    }
+}
+
 #[tauri::command]
 fn discover_runtime() -> Result<RuntimeInfo, String> {
     runtime::discover_runtime()
@@ -76,7 +130,7 @@ async fn query_current_usage(
     app: tauri::AppHandle,
     operation_state: tauri::State<'_, OperationState>,
     usage_cache: tauri::State<'_, UsageCache>,
-) -> Result<UsageSnapshot, String> {
+) -> Result<UsageSnapshot, UsageQueryError> {
     let _guard = operation_state.gate.read().await;
     let _query_slot = operation_state
         .query_slots
@@ -147,7 +201,7 @@ async fn query_saved_usage(
     operation_state: tauri::State<'_, OperationState>,
     usage_cache: tauri::State<'_, UsageCache>,
     account_id: String,
-) -> Result<UsageSnapshot, String> {
+) -> Result<UsageSnapshot, UsageQueryError> {
     let _guard = operation_state.gate.read().await;
     let _query_slot = operation_state
         .query_slots
@@ -506,6 +560,20 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
+fn start_background_clock(app: &tauri::AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut clock = tokio::time::interval(Duration::from_secs(30));
+        clock.tick().await;
+        loop {
+            clock.tick().await;
+            if app.emit("background-refresh-clock", ()).is_err() {
+                break;
+            }
+        }
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -518,6 +586,7 @@ pub fn run() {
             vault::cleanup_stale_login_auth(&data_dir).map_err(std::io::Error::other)?;
             app.manage(UsageCache::load(&data_dir));
             setup_tray(app)?;
+            start_background_clock(app.handle());
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -546,4 +615,25 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Codex Account Hub");
+}
+
+#[cfg(test)]
+mod query_error_tests {
+    use super::*;
+
+    #[test]
+    fn classifies_actionable_usage_errors() {
+        let auth = UsageQueryError::from("当前 auth.json 不包含 ChatGPT access token".to_string());
+        assert_eq!(auth.code, "authentication_required");
+        assert!(auth.reauth_required);
+
+        assert_eq!(
+            UsageQueryError::from("App Server 请求超时".to_string()).code,
+            "timeout"
+        );
+        assert_eq!(
+            UsageQueryError::from("未找到 codex.exe".to_string()).code,
+            "runtime_unavailable"
+        );
+    }
 }

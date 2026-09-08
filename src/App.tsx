@@ -5,14 +5,43 @@ import type { LimitWindow, RuntimeInfo, SavedAccount, SwitchOutcome, UsageSnapsh
 
 type LoadState = "idle" | "loading" | "ready" | "error";
 type Theme = "light" | "dark";
-type SavedUsageState = { state: LoadState; snapshot: UsageSnapshot | null; error: string | null };
+type AutoRefreshMinutes = 0 | 10 | 30 | 60;
+type UsageErrorCode = "authentication_required" | "timeout" | "runtime_unavailable" | "network" | "app_server" | "local_io" | "unknown";
+type UsageError = { code: UsageErrorCode; message: string; reauthRequired: boolean };
+type SavedUsageState = { state: LoadState; snapshot: UsageSnapshot | null; error: UsageError | null };
 type DialogState =
   | { type: "switch"; account: SavedAccount; restartCodex: boolean }
   | { type: "delete"; account: SavedAccount }
   | { type: "rename"; account: SavedAccount };
 
+function usageError(reason: unknown): UsageError {
+  if (reason && typeof reason === "object" && "message" in reason) {
+    const value = reason as Partial<UsageError>;
+    return {
+      code: value.code ?? "unknown",
+      message: String(value.message),
+      reauthRequired: Boolean(value.reauthRequired),
+    };
+  }
+  return { code: "unknown", message: reason instanceof Error ? reason.message : String(reason), reauthRequired: false };
+}
+
 function errorText(reason: unknown) {
-  return reason instanceof Error ? reason.message : String(reason);
+  return usageError(reason).message;
+}
+
+function errorLabel(error: UsageError) {
+  if (error.code === "authentication_required") return "登录失效";
+  if (error.code === "timeout") return "查询超时";
+  if (error.code === "runtime_unavailable") return "Codex 不可用";
+  if (error.code === "network") return "网络异常";
+  if (error.code === "local_io") return "本地文件异常";
+  return "读取失败";
+}
+
+function initialAutoRefresh(): AutoRefreshMinutes {
+  const saved = Number(window.localStorage.getItem("codex-account-hub-auto-refresh"));
+  return saved === 0 || saved === 10 || saved === 30 || saved === 60 ? saved : 10;
 }
 
 function formatWindow(minutes: number | null) {
@@ -135,12 +164,19 @@ export default function App() {
   const [snapshot, setSnapshot] = useState<UsageSnapshot | null>(null);
   const [state, setState] = useState<LoadState>("idle");
   const [error, setError] = useState<string | null>(null);
+  const [currentUsageError, setCurrentUsageError] = useState<UsageError | null>(null);
+  const [autoRefreshMinutes, setAutoRefreshMinutes] = useState<AutoRefreshMinutes>(initialAutoRefresh);
   const [savedAccounts, setSavedAccounts] = useState<SavedAccount[]>([]);
   const [savedUsage, setSavedUsage] = useState<Record<string, SavedUsageState>>({});
   const [refreshingVault, setRefreshingVault] = useState(false);
   const cacheHydrated = useRef(false);
   const fullRefreshInFlight = useRef(false);
   const vaultRefreshInFlight = useRef(false);
+  const backgroundRefreshInFlight = useRef(false);
+  const backgroundFailures = useRef(new Map<string, { failures: number; nextAllowedAt: number }>());
+  const nextBackgroundRefreshAt = useRef(Date.now() + autoRefreshMinutes * 60_000);
+  const autoRefreshMinutesRef = useRef(autoRefreshMinutes);
+  const operationBusyRef = useRef(false);
   const [importing, setImporting] = useState(false);
   const [addingAccount, setAddingAccount] = useState(false);
   const [switchingAccount, setSwitchingAccount] = useState<string | null>(null);
@@ -156,6 +192,14 @@ export default function App() {
     document.documentElement.dataset.theme = theme;
     window.localStorage.setItem("codex-account-hub-theme", theme);
   }, [theme]);
+
+  useEffect(() => {
+    window.localStorage.setItem("codex-account-hub-auto-refresh", String(autoRefreshMinutes));
+    autoRefreshMinutesRef.current = autoRefreshMinutes;
+    nextBackgroundRefreshAt.current = autoRefreshMinutes === 0
+      ? Number.POSITIVE_INFINITY
+      : Date.now() + autoRefreshMinutes * 60_000;
+  }, [autoRefreshMinutes]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 30_000);
@@ -174,7 +218,8 @@ export default function App() {
   }, [managingAccount, switchingAccount]);
 
   const refreshSavedAccounts = useCallback(async (accounts: SavedAccount[]) => {
-    if (!accounts.length || vaultRefreshInFlight.current) return;
+    const outcomes: Record<string, UsageError | null> = {};
+    if (!accounts.length || vaultRefreshInFlight.current) return outcomes;
     vaultRefreshInFlight.current = true;
     setRefreshingVault(true);
     setSavedUsage((previous) => {
@@ -187,14 +232,19 @@ export default function App() {
         try {
           const usage = await invoke<UsageSnapshot>("query_saved_usage", { accountId: account.id });
           setSavedUsage((previous) => ({ ...previous, [account.id]: { state: "ready", snapshot: usage, error: null } }));
+          backgroundFailures.current.delete(account.id);
+          outcomes[account.id] = null;
         } catch (reason) {
-          setSavedUsage((previous) => ({ ...previous, [account.id]: { state: "error", snapshot: previous[account.id]?.snapshot ?? null, error: errorText(reason) } }));
+          const queryError = usageError(reason);
+          setSavedUsage((previous) => ({ ...previous, [account.id]: { state: "error", snapshot: previous[account.id]?.snapshot ?? null, error: queryError } }));
+          outcomes[account.id] = queryError;
         }
       }));
     } finally {
       vaultRefreshInFlight.current = false;
       setRefreshingVault(false);
     }
+    return outcomes;
   }, []);
 
   const refresh = useCallback(async () => {
@@ -202,6 +252,7 @@ export default function App() {
     fullRefreshInFlight.current = true;
     setState("loading");
     setError(null);
+    setCurrentUsageError(null);
     const cachedUsage = cacheHydrated.current
       ? Promise.resolve<Record<string, UsageSnapshot> | null>(null)
       : invoke<Record<string, UsageSnapshot>>("load_usage_cache").catch(() => null);
@@ -210,7 +261,7 @@ export default function App() {
       invoke<RuntimeInfo>("discover_runtime"),
       invoke<UsageSnapshot>("query_current_usage"),
     ]);
-    let savedRefresh: Promise<void> = Promise.resolve();
+    let savedRefresh: Promise<Record<string, UsageError | null>> = Promise.resolve({});
     try {
       let savedResult: PromiseSettledResult<SavedAccount[]>;
       try {
@@ -244,6 +295,11 @@ export default function App() {
       const [runtimeResult, usageResult] = await runtimeAndUsage;
       if (runtimeResult.status === "fulfilled") setRuntime(runtimeResult.value);
       if (usageResult.status === "fulfilled") setSnapshot(usageResult.value);
+      if (usageResult.status === "fulfilled" && savedResult.status === "fulfilled") {
+        const active = savedResult.value.find((account) => account.isActive);
+        if (active) backgroundFailures.current.delete(active.id);
+      }
+      setCurrentUsageError(usageResult.status === "rejected" ? usageError(usageResult.reason) : null);
       const failures = [runtimeResult, usageResult, savedResult]
         .filter((result): result is PromiseRejectedResult => result.status === "rejected")
         .map((result) => errorText(result.reason));
@@ -252,25 +308,33 @@ export default function App() {
       await savedRefresh;
     } finally {
       fullRefreshInFlight.current = false;
+      const interval = autoRefreshMinutesRef.current;
+      if (interval > 0) nextBackgroundRefreshAt.current = Date.now() + interval * 60_000;
     }
   }, [refreshSavedAccounts]);
 
-  const refreshAccount = useCallback(async (account: SavedAccount) => {
+  const refreshAccount = useCallback(async (account: SavedAccount): Promise<UsageError | null> => {
     if (!account.isActive) {
-      await refreshSavedAccounts([account]);
-      return;
+      const outcomes = await refreshSavedAccounts([account]);
+      return outcomes[account.id] ?? null;
     }
-    if (fullRefreshInFlight.current || vaultRefreshInFlight.current) return;
+    if (fullRefreshInFlight.current || vaultRefreshInFlight.current) return null;
     fullRefreshInFlight.current = true;
     setState("loading");
     setError(null);
+    setCurrentUsageError(null);
     try {
       const usage = await invoke<UsageSnapshot>("query_current_usage");
       setSnapshot(usage);
+      backgroundFailures.current.delete(account.id);
       setState("ready");
+      return null;
     } catch (reason) {
-      setError(errorText(reason));
+      const queryError = usageError(reason);
+      setError(queryError.message);
+      setCurrentUsageError(queryError);
       setState("error");
+      return queryError;
     } finally {
       fullRefreshInFlight.current = false;
     }
@@ -324,6 +388,7 @@ export default function App() {
     setManagingAccount(account.id); setVaultError(null); setVaultNotice(null);
     try {
       await invoke<SavedAccount>("reauthorize_account", { accountId: account.id });
+      backgroundFailures.current.delete(account.id);
       setVaultNotice(`${account.label} 已重新授权。`);
       await refresh();
     } catch (reason) { setVaultError(errorText(reason)); }
@@ -370,7 +435,61 @@ export default function App() {
   const sortedAccounts = useMemo(() => [...savedAccounts].sort((left, right) => Number(right.isActive) - Number(left.isActive)), [savedAccounts]);
   const activeAccount = sortedAccounts.find((account) => account.isActive) ?? null;
   const operationBusy = importing || addingAccount || switchingAccount !== null || managingAccount !== null;
+  operationBusyRef.current = operationBusy;
   const currentName = activeAccount?.label ?? snapshot?.account?.email ?? "未识别当前账号";
+
+  const runBackgroundRefresh = useCallback(async () => {
+    if (
+      autoRefreshMinutesRef.current === 0
+      || backgroundRefreshInFlight.current
+      || operationBusyRef.current
+      || fullRefreshInFlight.current
+      || vaultRefreshInFlight.current
+    ) return;
+
+    backgroundRefreshInFlight.current = true;
+    try {
+      for (const account of sortedAccounts) {
+        if (operationBusyRef.current || fullRefreshInFlight.current || vaultRefreshInFlight.current) break;
+        const backoff = backgroundFailures.current.get(account.id);
+        if (backoff && backoff.nextAllowedAt > Date.now()) continue;
+
+        const queryError = await refreshAccount(account);
+        if (!queryError) {
+          backgroundFailures.current.delete(account.id);
+          continue;
+        }
+        const failures = (backoff?.failures ?? 0) + 1;
+        const delay = queryError.reauthRequired
+          ? Number.POSITIVE_INFINITY
+          : Math.min(6 * 60 * 60_000, 10 * 60_000 * 2 ** (failures - 1));
+        backgroundFailures.current.set(account.id, { failures, nextAllowedAt: Date.now() + delay });
+      }
+    } finally {
+      backgroundRefreshInFlight.current = false;
+    }
+  }, [refreshAccount, sortedAccounts]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen("background-refresh-clock", () => {
+      if (autoRefreshMinutesRef.current === 0 || Date.now() < nextBackgroundRefreshAt.current) return;
+      if (operationBusyRef.current || fullRefreshInFlight.current || vaultRefreshInFlight.current) {
+        nextBackgroundRefreshAt.current = Date.now() + 60_000;
+        return;
+      }
+      nextBackgroundRefreshAt.current = Date.now() + autoRefreshMinutesRef.current * 60_000;
+      void runBackgroundRefresh();
+    }).then((stop) => {
+      if (disposed) stop();
+      else unlisten = stop;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [runBackgroundRefresh]);
 
   useEffect(() => {
     void invoke("update_tray_current_account", { label: currentName }).catch(() => undefined);
@@ -381,6 +500,15 @@ export default function App() {
       <header className="topbar">
         <div className="brand"><span className="brand-mark">C</span><div><h1>Codex Account Hub</h1><p>账号额度与安全切换</p></div></div>
         <div className="top-actions">
+          <label className="auto-refresh-control" title="应用驻留托盘时也会按此周期自动刷新">
+            <span>自动刷新</span>
+            <select value={autoRefreshMinutes} onChange={(event) => setAutoRefreshMinutes(Number(event.target.value) as AutoRefreshMinutes)} disabled={operationBusy}>
+              <option value={0}>关闭</option>
+              <option value={10}>10 分钟</option>
+              <option value={30}>30 分钟</option>
+              <option value={60}>60 分钟</option>
+            </select>
+          </label>
           <button className="icon-button" aria-label={theme === "dark" ? "切换到浅色模式" : "切换到深色模式"} title={theme === "dark" ? "切换到浅色模式" : "切换到深色模式"} onClick={() => setTheme((value) => value === "dark" ? "light" : "dark")}>
             {theme === "dark" ? "☀" : "☾"}
           </button>
@@ -419,12 +547,12 @@ export default function App() {
             {sortedAccounts.map((account) => {
               const storedUsage = savedUsage[account.id];
               const usage: SavedUsageState = account.isActive && snapshot
-                ? { state: state === "loading" ? "loading" : error ? "error" : "ready", snapshot, error }
+                ? { state: state === "loading" ? "loading" : currentUsageError ? "error" : "ready", snapshot, error: currentUsageError }
                 : storedUsage ?? { state: account.isActive && state === "loading" ? "loading" : "idle", snapshot: null, error: null };
               return (
                 <article className={`account-row ${account.isActive ? "active" : ""}`} key={account.id}>
                   <div className="account-row-heading">
-                    <div className="account-identity"><div className="avatar">{account.label.trim().charAt(0).toUpperCase() || "C"}</div><div><div className="account-title"><h3>{account.label}</h3>{account.isActive && <span className="active-badge">当前账号</span>}</div><div className="account-subtitle"><span>{account.planType?.toUpperCase() ?? "UNKNOWN PLAN"}</span><span className={`sync-state ${usage.state}`}>{usage.state === "loading" ? "刷新中" : usage.state === "error" ? usage.snapshot ? "缓存数据" : "读取失败" : usage.state === "ready" ? "已同步" : "等待刷新"}</span><span>{formatCapturedAt(usage.snapshot?.capturedAt ?? null)}</span></div></div></div>
+                    <div className="account-identity"><div className="avatar">{account.label.trim().charAt(0).toUpperCase() || "C"}</div><div><div className="account-title"><h3>{account.label}</h3>{account.isActive && <span className="active-badge">当前账号</span>}</div><div className="account-subtitle"><span>{account.planType?.toUpperCase() ?? "UNKNOWN PLAN"}</span><span className={`sync-state ${usage.state}`}>{usage.state === "loading" ? "刷新中" : usage.state === "error" ? usage.snapshot ? "缓存数据" : usage.error ? errorLabel(usage.error) : "读取失败" : usage.state === "ready" ? "已同步" : "等待刷新"}</span><span>{formatCapturedAt(usage.snapshot?.capturedAt ?? null)}</span></div></div></div>
                     <div className="account-actions">
                       {!account.isActive && <button className="button switch-primary" onClick={() => setDialog({ type: "switch", account, restartCodex: true })} disabled={operationBusy}>{switchingAccount === account.id ? "正在切换…" : "切换并重启"}</button>}
                       <div className="menu-wrap" onClick={(event) => event.stopPropagation()}>
@@ -439,7 +567,7 @@ export default function App() {
                       </div>
                     </div>
                   </div>
-                  {usage.error && <div className="account-error"><span title={usage.error}>{usage.snapshot ? "刷新失败，正在显示上次成功数据" : "刷新失败"}：{usage.error}</span><button onClick={() => void refreshAccount(account)} disabled={state === "loading" || refreshingVault}>重试</button></div>}
+                  {usage.error && <div className="account-error"><span title={usage.error.message}>{usage.snapshot ? `${errorLabel(usage.error)}，正在显示上次成功数据` : errorLabel(usage.error)}：{usage.error.message}</span><button onClick={() => usage.error?.reauthRequired ? void reauthorizeAccount(account) : void refreshAccount(account)} disabled={state === "loading" || refreshingVault || operationBusy}>{usage.error.reauthRequired ? "重新授权" : "重试"}</button></div>}
                   <div className={`quota-grid ${usage.state === "loading" && !usage.snapshot ? "loading" : ""}`}>
                     <QuotaBlock window={usage.snapshot?.primary ?? null} tone="primary" now={now} />
                     <QuotaBlock window={usage.snapshot?.secondary ?? null} tone="secondary" now={now} />
