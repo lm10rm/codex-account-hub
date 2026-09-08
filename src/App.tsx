@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { LimitWindow, RuntimeInfo, SavedAccount, SwitchOutcome, UsageSnapshot } from "./types";
 
@@ -137,6 +138,7 @@ export default function App() {
   const [savedAccounts, setSavedAccounts] = useState<SavedAccount[]>([]);
   const [savedUsage, setSavedUsage] = useState<Record<string, SavedUsageState>>({});
   const [refreshingVault, setRefreshingVault] = useState(false);
+  const fullRefreshInFlight = useRef(false);
   const vaultRefreshInFlight = useRef(false);
   const [importing, setImporting] = useState(false);
   const [addingAccount, setAddingAccount] = useState(false);
@@ -195,30 +197,38 @@ export default function App() {
   }, []);
 
   const refresh = useCallback(async () => {
+    if (fullRefreshInFlight.current || vaultRefreshInFlight.current) return;
+    fullRefreshInFlight.current = true;
     setState("loading");
     setError(null);
     const runtimeAndUsage = Promise.allSettled([
       invoke<RuntimeInfo>("discover_runtime"),
       invoke<UsageSnapshot>("query_current_usage"),
     ]);
-    let savedResult: PromiseSettledResult<SavedAccount[]>;
+    let savedRefresh: Promise<void> = Promise.resolve();
     try {
-      const accounts = await invoke<SavedAccount[]>("list_saved_accounts");
-      savedResult = { status: "fulfilled", value: accounts };
-      setSavedAccounts(accounts);
-      void refreshSavedAccounts(accounts.filter((account) => !account.isActive));
-    } catch (reason) {
-      savedResult = { status: "rejected", reason };
-    }
+      let savedResult: PromiseSettledResult<SavedAccount[]>;
+      try {
+        const accounts = await invoke<SavedAccount[]>("list_saved_accounts");
+        savedResult = { status: "fulfilled", value: accounts };
+        setSavedAccounts(accounts);
+        savedRefresh = refreshSavedAccounts(accounts.filter((account) => !account.isActive));
+      } catch (reason) {
+        savedResult = { status: "rejected", reason };
+      }
 
-    const [runtimeResult, usageResult] = await runtimeAndUsage;
-    if (runtimeResult.status === "fulfilled") setRuntime(runtimeResult.value);
-    if (usageResult.status === "fulfilled") setSnapshot(usageResult.value);
-    const failures = [runtimeResult, usageResult, savedResult]
-      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
-      .map((result) => errorText(result.reason));
-    setError(failures.length ? failures.join("；") : null);
-    setState(usageResult.status === "fulfilled" ? "ready" : "error");
+      const [runtimeResult, usageResult] = await runtimeAndUsage;
+      if (runtimeResult.status === "fulfilled") setRuntime(runtimeResult.value);
+      if (usageResult.status === "fulfilled") setSnapshot(usageResult.value);
+      const failures = [runtimeResult, usageResult, savedResult]
+        .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+        .map((result) => errorText(result.reason));
+      setError(failures.length ? failures.join("；") : null);
+      setState(usageResult.status === "fulfilled" ? "ready" : "error");
+      await savedRefresh;
+    } finally {
+      fullRefreshInFlight.current = false;
+    }
   }, [refreshSavedAccounts]);
 
   const importCurrent = useCallback(async () => {
@@ -299,10 +309,27 @@ export default function App() {
 
   useEffect(() => { void refresh(); }, [refresh]);
 
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen("tray-refresh-requested", () => void refresh()).then((stop) => {
+      if (disposed) stop();
+      else unlisten = stop;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [refresh]);
+
   const sortedAccounts = useMemo(() => [...savedAccounts].sort((left, right) => Number(right.isActive) - Number(left.isActive)), [savedAccounts]);
   const activeAccount = sortedAccounts.find((account) => account.isActive) ?? null;
   const operationBusy = importing || addingAccount || switchingAccount !== null || managingAccount !== null;
   const currentName = activeAccount?.label ?? snapshot?.account?.email ?? "未识别当前账号";
+
+  useEffect(() => {
+    void invoke("update_tray_current_account", { label: currentName }).catch(() => undefined);
+  }, [currentName]);
 
   return (
     <main className="app-shell" onClick={() => setOpenMenu(null)}>
@@ -380,7 +407,7 @@ export default function App() {
         )}
       </section>
 
-      <footer className="app-footer"><span><span className="status-dot" /> 本地安全读取</span><span>OAuth 凭据由 Windows DPAPI 加密</span></footer>
+      <footer className="app-footer"><span><span className="status-dot" /> 本地安全读取</span><span>关闭窗口后驻留系统托盘</span></footer>
       {dialog && <ConfirmDialog dialog={dialog} renameValue={renameValue} busy={switchingAccount !== null || managingAccount !== null} onRenameValue={setRenameValue} onCancel={() => { if (!switchingAccount && !managingAccount) setDialog(null); }} onConfirm={() => void confirmDialog()} />}
     </main>
   );

@@ -13,6 +13,7 @@
 - 一键切换账号并重新启动 Codex，也可选择仅切换。
 - 支持账号重命名、单独刷新和删除。
 - 支持浅色与深色主题。
+- 关闭窗口后驻留系统托盘，可从托盘刷新或重新打开；重复启动只会唤醒已有窗口。
 - 使用 Windows DPAPI 加密保存认证信息。
 
 ## 安装
@@ -20,7 +21,7 @@
 前往 [GitHub Releases](https://github.com/lm10rm/codex-account-hub/releases/latest) 下载最新的 Windows x64 安装包：
 
 ```text
-Codex Account Hub_0.2.3_x64-setup.exe
+Codex Account Hub_0.3.0_x64-setup.exe
 ```
 
 安装包使用当前用户模式，不需要管理员权限。安装后可从桌面快捷方式或开始菜单启动，不会打开额外的终端窗口。
@@ -37,6 +38,8 @@ Codex Account Hub_0.2.3_x64-setup.exe
 
 切换会关闭正在运行的 Codex 窗口和任务，请先保存重要工作。
 
+关闭主窗口后应用会继续驻留在 Windows 系统托盘。单击托盘图标可恢复窗口；右键菜单可刷新全部账号或真正退出应用。
+
 ## 数据与安全
 
 - OAuth 凭据仅保存在本机，并使用当前 Windows 用户的 DPAPI 加密。
@@ -51,7 +54,7 @@ Codex Account Hub_0.2.3_x64-setup.exe
 
 - 仅支持 Windows x64。
 - 额度缓存目前只在本次应用运行期间保留。
-- 尚未提供托盘、开机启动和自动更新。
+- 尚未提供开机启动和自动更新。
 - 安装包尚未进行代码签名。
 - Codex 桌面端或 App Server 协议升级后，可能需要同步适配。
 

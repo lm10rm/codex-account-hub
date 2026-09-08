@@ -6,8 +6,9 @@ mod vault;
 use app_server::UsageSnapshot;
 use runtime::RuntimeInfo;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tokio::process::Command;
 use tokio::time::timeout;
 use vault::SavedAccount;
@@ -17,6 +18,12 @@ const MAX_CONCURRENT_USAGE_QUERIES: usize = 3;
 struct OperationState {
     gate: tokio::sync::RwLock<()>,
     query_slots: tokio::sync::Semaphore,
+}
+
+struct TrayState {
+    current_account: tauri::menu::MenuItem<tauri::Wry>,
+    tray: tauri::tray::TrayIcon<tauri::Wry>,
+    exiting: AtomicBool,
 }
 
 impl Default for OperationState {
@@ -42,6 +49,24 @@ struct SwitchOutcome {
 #[tauri::command]
 fn discover_runtime() -> Result<RuntimeInfo, String> {
     runtime::discover_runtime()
+}
+
+#[tauri::command]
+fn update_tray_current_account(app: tauri::AppHandle, label: Option<String>) -> Result<(), String> {
+    let label = label
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "未识别当前账号".to_string());
+    let menu_label = label.replace('&', "&&");
+    let tray_state = app.state::<TrayState>();
+    tray_state
+        .current_account
+        .set_text(format!("当前账号：{menu_label}"))
+        .map_err(|error| error.to_string())?;
+    tray_state
+        .tray
+        .set_tooltip(Some(format!("Codex Account Hub · {label}")))
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -371,17 +396,114 @@ impl LoginCommandWindowsExt for Command {
     }
 }
 
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
+    use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+
+    let open_item = MenuItem::with_id(
+        app,
+        "tray-open",
+        "打开 Codex Account Hub",
+        true,
+        None::<&str>,
+    )?;
+    let current_account = MenuItem::with_id(
+        app,
+        "tray-current-account",
+        "当前账号：正在读取…",
+        false,
+        None::<&str>,
+    )?;
+    let refresh_item = MenuItem::with_id(app, "tray-refresh", "刷新全部账号", true, None::<&str>)?;
+    let separator = PredefinedMenuItem::separator(app)?;
+    let quit_item = MenuItem::with_id(app, "tray-quit", "退出", true, None::<&str>)?;
+    let menu = Menu::with_items(
+        app,
+        &[
+            &open_item,
+            &current_account,
+            &refresh_item,
+            &separator,
+            &quit_item,
+        ],
+    )?;
+
+    let tray = TrayIconBuilder::with_id("main-tray")
+        .icon(
+            app.default_window_icon()
+                .cloned()
+                .ok_or_else(|| tauri::Error::AssetNotFound("default window icon".into()))?,
+        )
+        .tooltip("Codex Account Hub")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "tray-open" => show_main_window(app),
+            "tray-refresh" => {
+                let _ = app.emit("tray-refresh-requested", ());
+            }
+            "tray-quit" => {
+                app.state::<TrayState>()
+                    .exiting
+                    .store(true, Ordering::SeqCst);
+                app.exit(0);
+            }
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main_window(tray.app_handle());
+            }
+        })
+        .build(app)?;
+
+    app.manage(TrayState {
+        current_account,
+        tray,
+        exiting: AtomicBool::new(false),
+    });
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main_window(app);
+        }))
         .manage(OperationState::default())
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             vault::cleanup_stale_login_auth(&data_dir).map_err(std::io::Error::other)?;
+            setup_tray(app)?;
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if window.label() == "main" {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    if !window.state::<TrayState>().exiting.load(Ordering::SeqCst) {
+                        api.prevent_close();
+                        let _ = window.hide();
+                    }
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             discover_runtime,
+            update_tray_current_account,
             query_current_usage,
             list_saved_accounts,
             import_current_account,
