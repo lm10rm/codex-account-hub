@@ -28,6 +28,10 @@ function formatWindow(minutes: number | null) {
   return `${minutes} 分钟窗口`;
 }
 
+function errorText(reason: unknown) {
+  return reason instanceof Error ? reason.message : String(reason);
+}
+
 function UsageMeter({ window, tone }: { window: LimitWindow | null; tone: "cyan" | "violet" }) {
   const remaining = window?.remainingPercent ?? null;
   const used = window?.usedPercent ?? 0;
@@ -63,6 +67,7 @@ export default function App() {
   const [importing, setImporting] = useState(false);
   const [addingAccount, setAddingAccount] = useState(false);
   const [switchingAccount, setSwitchingAccount] = useState<string | null>(null);
+  const [managingAccount, setManagingAccount] = useState<string | null>(null);
   const [vaultError, setVaultError] = useState<string | null>(null);
   const [vaultNotice, setVaultNotice] = useState<string | null>(null);
 
@@ -112,21 +117,22 @@ export default function App() {
   const refresh = useCallback(async () => {
     setState("loading");
     setError(null);
-    try {
-      const [runtimeResult, usageResult, savedResult] = await Promise.all([
-        invoke<RuntimeInfo>("discover_runtime"),
-        invoke<UsageSnapshot>("query_current_usage"),
-        invoke<SavedAccount[]>("list_saved_accounts"),
-      ]);
-      setRuntime(runtimeResult);
-      setSnapshot(usageResult);
-      setSavedAccounts(savedResult);
-      setState("ready");
-      void refreshSavedAccounts(savedResult);
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-      setState("error");
+    const [runtimeResult, usageResult, savedResult] = await Promise.allSettled([
+      invoke<RuntimeInfo>("discover_runtime"),
+      invoke<UsageSnapshot>("query_current_usage"),
+      invoke<SavedAccount[]>("list_saved_accounts"),
+    ]);
+    if (runtimeResult.status === "fulfilled") setRuntime(runtimeResult.value);
+    if (usageResult.status === "fulfilled") setSnapshot(usageResult.value);
+    if (savedResult.status === "fulfilled") {
+      setSavedAccounts(savedResult.value);
+      void refreshSavedAccounts(savedResult.value);
     }
+    const failures = [runtimeResult, usageResult, savedResult]
+      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+      .map((result) => errorText(result.reason));
+    setError(failures.length ? failures.join("；") : null);
+    setState(usageResult.status === "fulfilled" ? "ready" : "error");
   }, [refreshSavedAccounts]);
 
   const importCurrent = useCallback(async () => {
@@ -188,6 +194,7 @@ export default function App() {
         } else {
           setVaultNotice(`已切换到 ${outcome.account.label}，请稍后手动重启 Codex。`);
         }
+        setSnapshot(null);
         await refresh();
       } catch (reason) {
         setVaultError(reason instanceof Error ? reason.message : String(reason));
@@ -197,6 +204,62 @@ export default function App() {
     },
     [refresh],
   );
+
+  const renameAccount = useCallback(async (account: SavedAccount) => {
+    const label = window.prompt("新的账号名称", account.label)?.trim();
+    if (!label || label === account.label) return;
+    setManagingAccount(account.id);
+    setVaultError(null);
+    try {
+      const updated = await invoke<SavedAccount>("rename_saved_account", { accountId: account.id, label });
+      setSavedAccounts((accounts) =>
+        accounts.map((item) => (item.id === account.id ? { ...updated, isActive: item.isActive } : item)),
+      );
+      setVaultNotice("账号名称已更新。");
+    } catch (reason) {
+      setVaultError(errorText(reason));
+    } finally {
+      setManagingAccount(null);
+    }
+  }, []);
+
+  const reauthorizeAccount = useCallback(
+    async (account: SavedAccount) => {
+      setManagingAccount(account.id);
+      setVaultError(null);
+      setVaultNotice(null);
+      try {
+        await invoke<SavedAccount>("reauthorize_account", { accountId: account.id });
+        setVaultNotice(`${account.label} 已重新授权。`);
+        await refresh();
+      } catch (reason) {
+        setVaultError(errorText(reason));
+      } finally {
+        setManagingAccount(null);
+      }
+    },
+    [refresh],
+  );
+
+  const deleteAccount = useCallback(async (account: SavedAccount) => {
+    if (account.isActive || !window.confirm(`删除保险库中的 ${account.label}？\n\n只删除本机加密副本，不会注销线上账号。`)) return;
+    setManagingAccount(account.id);
+    setVaultError(null);
+    try {
+      await invoke("delete_saved_account", { accountId: account.id });
+      setSavedAccounts((accounts) => accounts.filter((item) => item.id !== account.id));
+      setSavedUsage((usage) => {
+        const next = { ...usage };
+        delete next[account.id];
+        return next;
+      });
+      setVaultNotice(`${account.label} 已从本机保险库删除。`);
+    } catch (reason) {
+      setVaultError(errorText(reason));
+    } finally {
+      setManagingAccount(null);
+    }
+  }, []);
 
   useEffect(() => {
     void refresh();
@@ -239,14 +302,15 @@ export default function App() {
         </div>
       </section>
 
-      {error ? (
+      {error && (
         <section className="error-card">
-          <strong>暂时无法读取额度</strong>
+          <strong>{snapshot ? "部分数据刷新失败，已保留可用数据" : "暂时无法读取额度"}</strong>
           <p>{error}</p>
           <button onClick={() => void refresh()}>重试</button>
         </section>
-      ) : (
-        <section className="account-card">
+      )}
+      {(!error || snapshot) && (
+        <section className={`account-card ${error ? "stale" : ""}`}>
           <div className="account-header">
             <div className="avatar">{snapshot?.account?.email?.[0]?.toUpperCase() ?? "?"}</div>
             <div className="identity">
@@ -292,14 +356,14 @@ export default function App() {
           <button
             className="vault-button"
             onClick={() => void importCurrent()}
-            disabled={importing || addingAccount || !snapshot?.account}
+            disabled={importing || addingAccount || switchingAccount !== null || managingAccount !== null}
           >
             {importing ? "正在加密保存…" : "导入当前账号"}
           </button>
           <button
             className="vault-button primary"
             onClick={() => void addAccount()}
-            disabled={addingAccount || importing}
+            disabled={addingAccount || importing || switchingAccount !== null || managingAccount !== null}
           >
             {addingAccount ? "等待官方登录…" : "添加另一个账号"}
           </button>
@@ -330,13 +394,14 @@ export default function App() {
                     <div className="saved-account-name">
                       <strong>{account.label}</strong>
                       <span>{account.planType?.toUpperCase() ?? "UNKNOWN PLAN"}</span>
+                      {account.isActive && <span className="active-badge">当前账号</span>}
                     </div>
                     <div className="saved-card-actions">
                       <span className={`saved-status ${usage?.state ?? "idle"}`}>
                         {usage?.state === "loading"
                           ? "刷新中"
                           : usage?.state === "error"
-                            ? "读取失败"
+                            ? usage.snapshot ? "缓存数据" : "读取失败"
                             : usage?.state === "ready"
                               ? "已同步"
                               : "等待刷新"}
@@ -345,21 +410,22 @@ export default function App() {
                       <button
                         className="switch-button"
                         onClick={() => void switchAccount(account, true)}
-                        disabled={switchingAccount !== null || addingAccount || importing}
+                        disabled={account.isActive || switchingAccount !== null || managingAccount !== null || addingAccount || importing}
                       >
-                        {switchingAccount === account.id ? "正在切换…" : "切换并重启"}
+                        {account.isActive ? "当前账号" : switchingAccount === account.id ? "正在切换…" : "切换并重启"}
                       </button>
                       <button
                         className="switch-button subtle"
                         onClick={() => void switchAccount(account, false)}
-                        disabled={switchingAccount !== null || addingAccount || importing}
+                        disabled={account.isActive || switchingAccount !== null || managingAccount !== null || addingAccount || importing}
                       >
                         仅切换
                       </button>
                     </div>
                   </div>
-                  {usage?.error ? (
-                    <p className="saved-error">{usage.error}</p>
+                  {usage?.error && <p className="saved-error">{usage.snapshot ? `刷新失败，显示上次数据：${usage.error}` : usage.error}</p>}
+                  {!usage?.snapshot ? (
+                    !usage?.error && <p className="saved-error">正在等待额度数据…</p>
                   ) : (
                     <div className="saved-limit-grid">
                       <div>
@@ -374,6 +440,13 @@ export default function App() {
                       </div>
                     </div>
                   )}
+                  <div className="saved-account-management">
+                    <button onClick={() => void renameAccount(account)} disabled={managingAccount !== null || switchingAccount !== null}>重命名</button>
+                    <button onClick={() => void reauthorizeAccount(account)} disabled={managingAccount !== null || switchingAccount !== null}>
+                      {managingAccount === account.id ? "处理中…" : "重新授权"}
+                    </button>
+                    <button className="danger" onClick={() => void deleteAccount(account)} disabled={account.isActive || managingAccount !== null || switchingAccount !== null}>删除</button>
+                  </div>
                 </article>
               );
             })}

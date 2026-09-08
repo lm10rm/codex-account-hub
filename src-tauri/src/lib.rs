@@ -12,6 +12,9 @@ use tokio::process::Command;
 use tokio::time::timeout;
 use vault::SavedAccount;
 
+#[derive(Default)]
+struct OperationLock(tokio::sync::Mutex<()>);
+
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SwitchOutcome {
@@ -29,39 +32,59 @@ fn discover_runtime() -> Result<RuntimeInfo, String> {
 }
 
 #[tauri::command]
-async fn query_current_usage() -> Result<UsageSnapshot, String> {
+async fn query_current_usage(
+    operation_lock: tauri::State<'_, OperationLock>,
+) -> Result<UsageSnapshot, String> {
+    let _guard = operation_lock.0.lock().await;
     let runtime = runtime::discover_runtime()?;
     app_server::query_usage(&runtime.codex_path, &runtime.codex_home).await
 }
 
 #[tauri::command]
-fn list_saved_accounts(app: tauri::AppHandle) -> Result<Vec<SavedAccount>, String> {
+async fn list_saved_accounts(
+    app: tauri::AppHandle,
+    operation_lock: tauri::State<'_, OperationLock>,
+) -> Result<Vec<SavedAccount>, String> {
+    let _guard = operation_lock.0.lock().await;
+    let runtime = runtime::discover_runtime()?;
     let data_dir = app
         .path()
         .app_data_dir()
         .map_err(|error| error.to_string())?;
-    vault::list_accounts(&data_dir)
+    let active_id = vault::current_account_id(&runtime.codex_home).ok();
+    let mut accounts = vault::list_accounts(&data_dir)?;
+    for account in &mut accounts {
+        account.is_active = active_id.as_deref() == Some(account.id.as_str());
+    }
+    Ok(accounts)
 }
 
 #[tauri::command]
 async fn import_current_account(
     app: tauri::AppHandle,
+    operation_lock: tauri::State<'_, OperationLock>,
     label: Option<String>,
 ) -> Result<SavedAccount, String> {
+    let _guard = operation_lock.0.lock().await;
     let runtime = runtime::discover_runtime()?;
-    let snapshot = app_server::query_usage(&runtime.codex_path, &runtime.codex_home).await?;
+    let account = app_server::query_usage(&runtime.codex_path, &runtime.codex_home)
+        .await
+        .ok()
+        .and_then(|snapshot| snapshot.account);
     let data_dir = app
         .path()
         .app_data_dir()
         .map_err(|error| error.to_string())?;
-    vault::import_current(&data_dir, &runtime.codex_home, snapshot.account, label)
+    vault::import_current(&data_dir, &runtime.codex_home, account, label)
 }
 
 #[tauri::command]
 async fn query_saved_usage(
     app: tauri::AppHandle,
+    operation_lock: tauri::State<'_, OperationLock>,
     account_id: String,
 ) -> Result<UsageSnapshot, String> {
+    let _guard = operation_lock.0.lock().await;
     let runtime = runtime::discover_runtime()?;
     let data_dir = app
         .path()
@@ -90,30 +113,27 @@ async fn query_saved_usage(
 #[tauri::command]
 async fn add_account_with_login(
     app: tauri::AppHandle,
+    operation_lock: tauri::State<'_, OperationLock>,
     label: Option<String>,
 ) -> Result<SavedAccount, String> {
+    let _guard = operation_lock.0.lock().await;
     let runtime = runtime::discover_runtime()?;
     let data_dir = app
         .path()
         .app_data_dir()
         .map_err(|error| error.to_string())?;
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let login_home = data_dir
-        .join("login")
-        .join(format!("{}-{nonce}", std::process::id()));
-    std::fs::create_dir_all(&login_home)
-        .map_err(|error| format!("无法创建隔离登录目录：{error}"))?;
+    let login_home = create_login_home(&data_dir)?;
 
     let operation = async {
         run_interactive_login(&runtime.codex_path, &login_home).await?;
         let home_text = login_home
             .to_str()
             .ok_or_else(|| "隔离登录目录不是有效路径".to_string())?;
-        let snapshot = app_server::query_usage(&runtime.codex_path, home_text).await?;
-        vault::import_current(&data_dir, home_text, snapshot.account, label)
+        let account = app_server::query_usage(&runtime.codex_path, home_text)
+            .await
+            .ok()
+            .and_then(|snapshot| snapshot.account);
+        vault::import_current(&data_dir, home_text, account, label)
     }
     .await;
     let cleanup = vault::remove_plain_auth(&login_home);
@@ -128,19 +148,95 @@ async fn add_account_with_login(
 }
 
 #[tauri::command]
+async fn reauthorize_account(
+    app: tauri::AppHandle,
+    operation_lock: tauri::State<'_, OperationLock>,
+    account_id: String,
+) -> Result<SavedAccount, String> {
+    let _guard = operation_lock.0.lock().await;
+    let runtime = runtime::discover_runtime()?;
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
+    if !vault::list_accounts(&data_dir)?
+        .iter()
+        .any(|account| account.id == account_id)
+    {
+        return Err("找不到这个保险库账号".to_string());
+    }
+    let login_home = create_login_home(&data_dir)?;
+
+    let operation = async {
+        run_interactive_login(&runtime.codex_path, &login_home).await?;
+        let logged_in_id = vault::isolated_account_id(&login_home)?;
+        if logged_in_id != account_id {
+            return Err("登录的不是所选账号，已取消覆盖；请用该账号重新登录".to_string());
+        }
+        let home_text = login_home
+            .to_str()
+            .ok_or_else(|| "隔离登录目录不是有效路径".to_string())?;
+        let account = app_server::query_usage(&runtime.codex_path, home_text)
+            .await
+            .ok()
+            .and_then(|snapshot| snapshot.account);
+        vault::import_current(&data_dir, home_text, account, None)
+    }
+    .await;
+    let cleanup = vault::remove_plain_auth(&login_home);
+    combine_operation_and_cleanup(operation, cleanup)
+}
+
+#[tauri::command]
+async fn rename_saved_account(
+    app: tauri::AppHandle,
+    operation_lock: tauri::State<'_, OperationLock>,
+    account_id: String,
+    label: String,
+) -> Result<SavedAccount, String> {
+    let _guard = operation_lock.0.lock().await;
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
+    vault::rename_account(&data_dir, &account_id, &label)
+}
+
+#[tauri::command]
+async fn delete_saved_account(
+    app: tauri::AppHandle,
+    operation_lock: tauri::State<'_, OperationLock>,
+    account_id: String,
+) -> Result<(), String> {
+    let _guard = operation_lock.0.lock().await;
+    let runtime = runtime::discover_runtime()?;
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
+    let current_id = vault::current_account_id(&runtime.codex_home)?;
+    vault::delete_account(&data_dir, &account_id, Some(&current_id))
+}
+
+#[tauri::command]
 async fn switch_saved_account(
     app: tauri::AppHandle,
+    operation_lock: tauri::State<'_, OperationLock>,
     account_id: String,
     restart_codex: bool,
 ) -> Result<SwitchOutcome, String> {
+    let _guard = operation_lock.0.lock().await;
     let runtime = runtime::discover_runtime()?;
     let data_dir = app
         .path()
         .app_data_dir()
         .map_err(|error| error.to_string())?;
 
-    let current = app_server::query_usage(&runtime.codex_path, &runtime.codex_home).await?;
-    vault::import_current(&data_dir, &runtime.codex_home, current.account, None)?;
+    let current_account = app_server::query_usage(&runtime.codex_path, &runtime.codex_home)
+        .await
+        .ok()
+        .and_then(|snapshot| snapshot.account);
+    vault::import_current(&data_dir, &runtime.codex_home, current_account, None)?;
     vault::activate_account(&data_dir, &account_id, &runtime.codex_home)?;
     let account = vault::list_accounts(&data_dir)?
         .into_iter()
@@ -178,6 +274,32 @@ async fn switch_saved_account(
             processes_closed: 0,
             restart_warning: Some(warning),
         }),
+    }
+}
+
+fn create_login_home(data_dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let login_home = data_dir
+        .join("login")
+        .join(format!("{}-{nonce}", std::process::id()));
+    std::fs::create_dir_all(&login_home)
+        .map_err(|error| format!("无法创建隔离登录目录：{error}"))?;
+    Ok(login_home)
+}
+
+fn combine_operation_and_cleanup<T>(
+    operation: Result<T, String>,
+    cleanup: Result<(), String>,
+) -> Result<T, String> {
+    match (operation, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(operation_error), Err(cleanup_error)) => {
+            Err(format!("{operation_error}；{cleanup_error}"))
+        }
     }
 }
 
@@ -229,6 +351,7 @@ impl LoginCommandWindowsExt for Command {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(OperationLock::default())
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             vault::cleanup_stale_login_auth(&data_dir).map_err(std::io::Error::other)?;
@@ -241,6 +364,9 @@ pub fn run() {
             import_current_account,
             query_saved_usage,
             add_account_with_login,
+            reauthorize_account,
+            rename_saved_account,
+            delete_saved_account,
             switch_saved_account
         ])
         .run(tauri::generate_context!())

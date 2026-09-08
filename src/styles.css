@@ -191,6 +191,10 @@ button {
   overflow: hidden;
 }
 
+.account-card.stale {
+  opacity: 0.82;
+}
+
 .account-header {
   padding: 25px 28px;
   border-bottom: 1px solid rgba(180, 229, 216, 0.09);
@@ -391,6 +395,15 @@ button {
   letter-spacing: 0.12em;
 }
 
+.saved-account-name > .active-badge {
+  display: inline-block;
+  width: fit-content;
+  margin-top: 8px;
+  padding: 4px 8px;
+  color: #6ee6c2;
+  letter-spacing: normal;
+}
+
 .saved-card-actions {
   display: flex;
   align-items: center;
@@ -474,6 +487,37 @@ button {
 .saved-error {
   margin: 14px 0 0;
   font-size: 11px;
+}
+
+.saved-account-management {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+  margin-top: 13px;
+  padding-top: 11px;
+  border-top: 1px solid rgba(164, 221, 204, 0.07);
+}
+
+.saved-account-management button {
+  border: 0;
+  padding: 2px;
+  color: #78928b;
+  background: transparent;
+  cursor: pointer;
+  font-size: 10px;
+}
+
+.saved-account-management button:hover:not(:disabled) {
+  color: #b8eee0;
+}
+
+.saved-account-management button.danger:hover:not(:disabled) {
+  color: #e7a29a;
+}
+
+.saved-account-management button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .error-card {

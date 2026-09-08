@@ -32,6 +32,7 @@ export interface SavedAccount {
   email: string | null;
   planType: string | null;
   importedAt: number;
+  isActive: boolean;
 }
 
 export interface SwitchOutcome {

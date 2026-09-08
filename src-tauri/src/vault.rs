@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const INDEX_VERSION: u32 = 1;
+const MAX_SWITCH_BACKUPS: usize = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -15,6 +16,8 @@ pub struct SavedAccount {
     pub email: Option<String>,
     pub plan_type: Option<String>,
     pub imported_at: u64,
+    #[serde(default)]
+    pub is_active: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -35,6 +38,94 @@ impl Default for AccountIndex {
 
 pub fn list_accounts(data_dir: &Path) -> Result<Vec<SavedAccount>, String> {
     Ok(read_index(data_dir)?.accounts)
+}
+
+pub fn current_account_id(codex_home: &str) -> Result<String, String> {
+    let auth_path = Path::new(codex_home).join("auth.json");
+    let auth = fs::read(&auth_path)
+        .map_err(|error| format!("无法读取当前认证文件 {}：{error}", auth_path.display()))?;
+    validate_auth(&auth)?;
+    auth_identity(&auth)
+}
+
+pub fn isolated_account_id(home: &Path) -> Result<String, String> {
+    let auth = fs::read(home.join("auth.json"))
+        .map_err(|error| format!("无法读取隔离认证文件：{error}"))?;
+    validate_auth(&auth)?;
+    auth_identity(&auth)
+}
+
+pub fn rename_account(
+    data_dir: &Path,
+    account_id: &str,
+    label: &str,
+) -> Result<SavedAccount, String> {
+    validate_account_id(account_id)?;
+    let label = label.trim();
+    if label.is_empty() {
+        return Err("账号名称不能为空".to_string());
+    }
+    if label.chars().count() > 80 {
+        return Err("账号名称不能超过 80 个字符".to_string());
+    }
+
+    let mut index = read_index(data_dir)?;
+    let account = index
+        .accounts
+        .iter_mut()
+        .find(|account| account.id == account_id)
+        .ok_or_else(|| "找不到这个保险库账号".to_string())?;
+    account.label = label.to_string();
+    let updated = account.clone();
+    write_index(data_dir, &index)?;
+    Ok(updated)
+}
+
+pub fn delete_account(
+    data_dir: &Path,
+    account_id: &str,
+    current_account_id: Option<&str>,
+) -> Result<(), String> {
+    validate_account_id(account_id)?;
+    if current_account_id == Some(account_id) {
+        return Err("不能删除当前正在使用的账号，请先切换到其他账号".to_string());
+    }
+
+    let mut index = read_index(data_dir)?;
+    let position = index
+        .accounts
+        .iter()
+        .position(|account| account.id == account_id)
+        .ok_or_else(|| "找不到这个保险库账号".to_string())?;
+    let runtime_path = data_dir.join("runtime").join(account_id);
+    if runtime_path.exists() {
+        remove_plain_auth(&runtime_path)?;
+        fs::remove_dir_all(&runtime_path)
+            .map_err(|error| format!("无法清理账号运行目录：{error}"))?;
+    }
+    let vault_path = data_dir.join("vault").join(format!("{account_id}.dpapi"));
+    let staged_path = data_dir
+        .join("vault")
+        .join(format!(".{account_id}.deleting"));
+    if staged_path.exists() {
+        fs::remove_file(&staged_path).map_err(|error| format!("无法清理上次删除残留：{error}"))?;
+    }
+    if vault_path.exists() {
+        fs::rename(&vault_path, &staged_path)
+            .map_err(|error| format!("无法暂存待删除账号：{error}"))?;
+    }
+
+    index.accounts.remove(position);
+    if let Err(error) = write_index(data_dir, &index) {
+        if staged_path.exists() {
+            let _ = fs::rename(&staged_path, &vault_path);
+        }
+        return Err(error);
+    }
+    if staged_path.exists() {
+        let _ = fs::remove_file(&staged_path);
+    }
+    Ok(())
 }
 
 pub fn prepare_isolated_home(data_dir: &Path, account_id: &str) -> Result<PathBuf, String> {
@@ -62,6 +153,7 @@ pub fn activate_account(data_dir: &Path, account_id: &str, codex_home: &str) -> 
         .join("switch-backups")
         .join(format!("{}-{current_id}.dpapi", now_seconds()));
     atomic_write(&backup_path, &encrypted_backup)?;
+    prune_switch_backups(data_dir, MAX_SWITCH_BACKUPS)?;
 
     replace_auth_file(&auth_path, &target_auth)?;
     let activated = fs::read(&auth_path).map_err(|error| format!("无法验证切换结果：{error}"))?;
@@ -147,17 +239,20 @@ pub fn import_current(
     atomic_write(&vault_dir.join(format!("{id}.dpapi")), &encrypted)?;
 
     let mut index = read_index(data_dir)?;
-    let email = account.as_ref().and_then(|value| value.email.clone());
-    let plan_type = account.as_ref().and_then(|value| value.plan_type.clone());
+    let existing = index.accounts.iter().find(|value| value.id == id).cloned();
+    let email = account
+        .as_ref()
+        .and_then(|value| value.email.clone())
+        .or_else(|| existing.as_ref().and_then(|value| value.email.clone()));
+    let plan_type = account
+        .as_ref()
+        .and_then(|value| value.plan_type.clone())
+        .or_else(|| existing.as_ref().and_then(|value| value.plan_type.clone()));
     let default_label = email.clone().unwrap_or_else(|| "Codex 账号".to_string());
     let requested_label = label
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
-    let existing_label = index
-        .accounts
-        .iter()
-        .find(|value| value.id == id)
-        .map(|value| value.label.clone());
+    let existing_label = existing.map(|value| value.label);
     let clean_label = requested_label.or(existing_label).unwrap_or(default_label);
     if clean_label.chars().count() > 80 {
         return Err("账号名称不能超过 80 个字符".to_string());
@@ -169,6 +264,7 @@ pub fn import_current(
         email,
         plan_type,
         imported_at: now_seconds(),
+        is_active: false,
     };
     if let Some(existing) = index.accounts.iter_mut().find(|value| value.id == id) {
         *existing = saved.clone();
@@ -261,7 +357,32 @@ fn index_path(data_dir: &Path) -> PathBuf {
     data_dir.join("accounts.json")
 }
 
+fn prune_switch_backups(data_dir: &Path, keep: usize) -> Result<(), String> {
+    let backup_dir = data_dir.join("switch-backups");
+    if !backup_dir.exists() {
+        return Ok(());
+    }
+    let mut backups = fs::read_dir(&backup_dir)
+        .map_err(|error| format!("无法读取切换备份目录：{error}"))?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|value| value == "dpapi")
+        })
+        .collect::<Vec<_>>();
+    backups.sort_by_key(|entry| std::cmp::Reverse(entry.file_name()));
+    for backup in backups.into_iter().skip(keep) {
+        fs::remove_file(backup.path()).map_err(|error| format!("无法轮换切换备份：{error}"))?;
+    }
+    Ok(())
+}
+
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
     let parent = path
         .parent()
         .ok_or_else(|| "目标文件没有父目录".to_string())?;
@@ -270,11 +391,50 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
         ".{}.tmp",
         path.file_name().unwrap_or_default().to_string_lossy()
     ));
-    fs::write(&temp, bytes).map_err(|error| format!("写入临时文件失败：{error}"))?;
-    if path.exists() {
-        fs::remove_file(path).map_err(|error| format!("无法更新账号文件：{error}"))?;
+    if temp.exists() {
+        fs::remove_file(&temp).map_err(|error| format!("无法清理旧临时文件：{error}"))?;
     }
-    fs::rename(&temp, path).map_err(|error| format!("提交账号文件失败：{error}"))
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temp)
+        .map_err(|error| format!("写入临时文件失败：{error}"))?;
+    file.write_all(bytes)
+        .map_err(|error| format!("写入临时文件失败：{error}"))?;
+    file.sync_all()
+        .map_err(|error| format!("同步临时文件失败：{error}"))?;
+    drop(file);
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::GetLastError;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        };
+        let source: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
+        let destination: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let ok = unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if ok == 0 {
+            let code = unsafe { GetLastError() };
+            let _ = fs::remove_file(&temp);
+            return Err(format!("原子提交账号文件失败：{code}"));
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        if path.exists() {
+            fs::remove_file(path).map_err(|error| format!("无法更新账号文件：{error}"))?;
+        }
+        fs::rename(&temp, path).map_err(|error| format!("提交账号文件失败：{error}"))
+    }
 }
 
 #[cfg(windows)]
@@ -440,6 +600,93 @@ mod tests {
     fn rejects_account_ids_that_could_escape_the_vault() {
         assert!(validate_account_id("../auth").is_err());
         assert!(validate_account_id("aaaaaaaaaaaaaaaaaaaaaaaa").is_ok());
+    }
+
+    #[test]
+    fn keeps_only_the_newest_switch_backups() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "codex-account-hub-backup-test-{}-{}",
+            std::process::id(),
+            now_seconds()
+        ));
+        let backup_dir = test_dir.join("switch-backups");
+        fs::create_dir_all(&backup_dir).unwrap();
+        for number in 0..7 {
+            fs::write(
+                backup_dir.join(format!("{number:02}-account.dpapi")),
+                b"test",
+            )
+            .unwrap();
+        }
+        fs::write(backup_dir.join("ignore.txt"), b"test").unwrap();
+        prune_switch_backups(&test_dir, 5).unwrap();
+        let dpapi_count = fs::read_dir(&backup_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|value| value == "dpapi")
+            })
+            .count();
+        assert_eq!(dpapi_count, 5);
+        assert!(backup_dir.join("ignore.txt").exists());
+        fs::remove_dir_all(&test_dir).unwrap();
+    }
+
+    #[test]
+    fn renames_and_safely_deletes_saved_accounts() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "codex-account-hub-account-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let account_id = "aaaaaaaaaaaaaaaaaaaaaaaa";
+        let other_id = "bbbbbbbbbbbbbbbbbbbbbbbb";
+        let account = SavedAccount {
+            id: account_id.to_string(),
+            label: "旧名称".to_string(),
+            email: None,
+            plan_type: None,
+            imported_at: now_seconds(),
+            is_active: false,
+        };
+        write_index(
+            &test_dir,
+            &AccountIndex {
+                version: INDEX_VERSION,
+                accounts: vec![account],
+            },
+        )
+        .unwrap();
+        fs::create_dir_all(test_dir.join("vault")).unwrap();
+        fs::write(
+            test_dir.join("vault").join(format!("{account_id}.dpapi")),
+            b"encrypted-fixture",
+        )
+        .unwrap();
+
+        assert_eq!(
+            rename_account(&test_dir, account_id, "新名称")
+                .unwrap()
+                .label,
+            "新名称"
+        );
+        assert!(delete_account(&test_dir, account_id, Some(account_id)).is_err());
+        assert_eq!(list_accounts(&test_dir).unwrap().len(), 1);
+        delete_account(&test_dir, account_id, Some(other_id)).unwrap();
+        assert!(list_accounts(&test_dir).unwrap().is_empty());
+        assert!(
+            !test_dir
+                .join("vault")
+                .join(format!("{account_id}.dpapi"))
+                .exists()
+        );
+        fs::remove_dir_all(&test_dir).unwrap();
     }
 
     #[cfg(windows)]
