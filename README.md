@@ -20,7 +20,7 @@
 前往 [GitHub Releases](https://github.com/lm10rm/codex-account-hub/releases/latest) 下载最新的 Windows x64 安装包：
 
 ```text
-Codex Account Hub_0.2.1_x64-setup.exe
+Codex Account Hub_0.2.2_x64-setup.exe
 ```
 
 安装包使用当前用户模式，不需要管理员权限。安装后可从桌面快捷方式或开始菜单启动，不会打开额外的终端窗口。

@@ -197,20 +197,23 @@ export default function App() {
   const refresh = useCallback(async () => {
     setState("loading");
     setError(null);
-    const [runtimeResult, usageResult, savedResult] = await Promise.allSettled([
+    const runtimeAndUsage = Promise.allSettled([
       invoke<RuntimeInfo>("discover_runtime"),
       invoke<UsageSnapshot>("query_current_usage"),
-      invoke<SavedAccount[]>("list_saved_accounts"),
     ]);
+    let savedResult: PromiseSettledResult<SavedAccount[]>;
+    try {
+      const accounts = await invoke<SavedAccount[]>("list_saved_accounts");
+      savedResult = { status: "fulfilled", value: accounts };
+      setSavedAccounts(accounts);
+      void refreshSavedAccounts(accounts.filter((account) => !account.isActive));
+    } catch (reason) {
+      savedResult = { status: "rejected", reason };
+    }
+
+    const [runtimeResult, usageResult] = await runtimeAndUsage;
     if (runtimeResult.status === "fulfilled") setRuntime(runtimeResult.value);
     if (usageResult.status === "fulfilled") setSnapshot(usageResult.value);
-    if (savedResult.status === "fulfilled") {
-      setSavedAccounts(savedResult.value);
-      const accountsToRefresh = usageResult.status === "fulfilled"
-        ? savedResult.value.filter((account) => !account.isActive)
-        : savedResult.value;
-      void refreshSavedAccounts(accountsToRefresh);
-    }
     const failures = [runtimeResult, usageResult, savedResult]
       .filter((result): result is PromiseRejectedResult => result.status === "rejected")
       .map((result) => errorText(result.reason));

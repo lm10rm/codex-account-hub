@@ -21,7 +21,7 @@ impl Default for OperationState {
     fn default() -> Self {
         Self {
             gate: tokio::sync::RwLock::new(()),
-            query_slots: tokio::sync::Semaphore::new(2),
+            query_slots: tokio::sync::Semaphore::new(3),
         }
     }
 }

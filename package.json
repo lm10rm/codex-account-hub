@@ -1,6 +1,6 @@
 {
   "name": "codex-account-hub",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "type": "module",
   "description": "Local-first Codex account usage dashboard and safe account switcher.",
