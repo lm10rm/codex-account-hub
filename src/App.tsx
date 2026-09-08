@@ -312,8 +312,8 @@ export default function App() {
           <button className="icon-button" aria-label={theme === "dark" ? "切换到浅色模式" : "切换到深色模式"} title={theme === "dark" ? "切换到浅色模式" : "切换到深色模式"} onClick={() => setTheme((value) => value === "dark" ? "light" : "dark")}>
             {theme === "dark" ? "☀" : "☾"}
           </button>
-          <button className="button secondary" onClick={() => void refresh()} disabled={state === "loading" || operationBusy}>
-            <span className={state === "loading" ? "spin" : ""}>↻</span>{state === "loading" ? "正在刷新" : "刷新全部"}
+          <button className="button secondary" onClick={() => void refresh()} disabled={state === "loading" || refreshingVault || operationBusy}>
+            <span className={state === "loading" || refreshingVault ? "spin" : ""}>↻</span>{state === "loading" || refreshingVault ? "正在刷新" : "刷新全部"}
           </button>
         </div>
       </header>
@@ -346,7 +346,9 @@ export default function App() {
           <div className="account-list">
             {sortedAccounts.map((account) => {
               const storedUsage = savedUsage[account.id];
-              const usage: SavedUsageState = account.isActive && snapshot ? { state: error ? "error" : "ready", snapshot, error } : storedUsage ?? { state: "idle", snapshot: null, error: null };
+              const usage: SavedUsageState = account.isActive && snapshot
+                ? { state: state === "loading" ? "loading" : error ? "error" : "ready", snapshot, error }
+                : storedUsage ?? { state: account.isActive && state === "loading" ? "loading" : "idle", snapshot: null, error: null };
               return (
                 <article className={`account-row ${account.isActive ? "active" : ""}`} key={account.id}>
                   <div className="account-row-heading">

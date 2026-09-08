@@ -12,6 +12,8 @@ use tokio::process::Command;
 use tokio::time::timeout;
 use vault::SavedAccount;
 
+const MAX_CONCURRENT_USAGE_QUERIES: usize = 3;
+
 struct OperationState {
     gate: tokio::sync::RwLock<()>,
     query_slots: tokio::sync::Semaphore,
@@ -21,7 +23,7 @@ impl Default for OperationState {
     fn default() -> Self {
         Self {
             gate: tokio::sync::RwLock::new(()),
-            query_slots: tokio::sync::Semaphore::new(3),
+            query_slots: tokio::sync::Semaphore::new(MAX_CONCURRENT_USAGE_QUERIES),
         }
     }
 }
