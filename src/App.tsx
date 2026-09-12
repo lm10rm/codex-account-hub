@@ -6,6 +6,7 @@ import { isSnapshotStale, parseAutoRefresh, snapshotForAccount } from "./dashboa
 import type { AutoRefreshMinutes } from "./dashboard-state";
 
 type LoadState = "idle" | "loading" | "ready" | "error";
+const NOTICE_DURATION_MS = 5_000;
 type Theme = "light" | "dark";
 type UsageErrorCode = "authentication_required" | "account_changed" | "timeout" | "runtime_unavailable" | "network" | "app_server" | "local_io" | "unknown";
 type UsageError = { code: UsageErrorCode; message: string; reauthRequired: boolean };
@@ -166,6 +167,7 @@ export default function App() {
   const [state, setState] = useState<LoadState>("idle");
   const [error, setError] = useState<string | null>(null);
   const [currentAccountId, setCurrentAccountId] = useState<string | null>(null);
+  const currentAccountIdRef = useRef<string | null>(null);
   const [autoRefreshMinutes, setAutoRefreshMinutes] = useState<AutoRefreshMinutes>(initialAutoRefresh);
   const [savedAccounts, setSavedAccounts] = useState<SavedAccount[]>([]);
   const [savedUsage, setSavedUsage] = useState<Record<string, SavedUsageState>>({});
@@ -196,6 +198,24 @@ export default function App() {
   const [restarting, setRestarting] = useState(false);
   const [restartDialog, setRestartDialog] = useState(false);
   const [restartMessage, setRestartMessage] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!vaultNotice || vaultError || error) return;
+    const timer = window.setTimeout(() => setVaultNotice(null), NOTICE_DURATION_MS);
+    return () => window.clearTimeout(timer);
+  }, [vaultNotice, vaultError, error]);
+
+  useEffect(() => {
+    if (!restartMessage || restartNeeded) return;
+    const timer = window.setTimeout(() => setRestartMessage(null), NOTICE_DURATION_MS);
+    return () => window.clearTimeout(timer);
+  }, [restartMessage, restartNeeded]);
+
+  useEffect(() => {
+    if (!recoveryReport?.messages.length || recoveryReport.needsAttention) return;
+    const timer = window.setTimeout(() => setRecoveryReport(null), NOTICE_DURATION_MS);
+    return () => window.clearTimeout(timer);
+  }, [recoveryReport]);
 
   useEffect(() => {
     void invoke<RecoveryReport>("recovery_status").then((report) => {
@@ -229,6 +249,7 @@ export default function App() {
 
   const reconcileAccounts = useCallback(async () => {
     const listing = await invoke<AccountList>("list_saved_accounts");
+    currentAccountIdRef.current = listing.currentAccountId;
     setCurrentAccountId(listing.currentAccountId);
     setSavedAccounts(listing.accounts);
     setSnapshot((previous) => snapshotForAccount(previous, listing.currentAccountId));
@@ -443,7 +464,7 @@ export default function App() {
   }, [refresh]);
 
   const executeRename = useCallback(async (account: SavedAccount, label: string) => {
-    setManagingAccount(account.id); setVaultError(null);
+    setManagingAccount(account.id); setVaultError(null); setVaultNotice(null);
     try {
       const updated = await invoke<SavedAccount>("rename_saved_account", { accountId: account.id, label });
       setSavedAccounts((accounts) => accounts.map((item) => item.id === account.id ? { ...updated, isActive: item.isActive } : item));
@@ -492,7 +513,7 @@ export default function App() {
   };
 
   const executeDelete = useCallback(async (account: SavedAccount) => {
-    setManagingAccount(account.id); setVaultError(null);
+    setManagingAccount(account.id); setVaultError(null); setVaultNotice(null);
     try {
       await invoke("delete_saved_account", { accountId: account.id });
       setSavedAccounts((accounts) => accounts.filter((item) => item.id !== account.id));
@@ -571,11 +592,27 @@ export default function App() {
   }, [reconcileAccounts, refreshAccount]);
 
   useEffect(() => {
-    const onFocus = () => {
-      if (!operationBusyRef.current && !backgroundRefreshInFlight.current) void refresh();
+    let disposed = false;
+    let checking = false;
+    let unlisten: (() => void) | undefined;
+    const busy = () => operationBusyRef.current || backgroundRefreshInFlight.current
+      || fullRefreshInFlight.current || vaultRefreshInFlight.current;
+    const onFocus = async () => {
+      if (disposed || checking || busy()) return;
+      checking = true;
+      try {
+        // Native activation only checks local identity. WebView focus also fires after title-bar drags.
+        const listing = await invoke<AccountList>("list_saved_accounts");
+        if (!disposed && !busy() && listing.currentAccountId !== currentAccountIdRef.current) await refresh();
+      } catch (reason) {
+        if (!disposed && !busy()) setError(errorText(reason));
+      } finally { checking = false; }
     };
-    window.addEventListener("focus", onFocus);
-    return () => window.removeEventListener("focus", onFocus);
+    void listen("tauri://focus", () => void onFocus(), { target: { kind: "Window", label: "main" } }).then((stop) => {
+      if (disposed) stop();
+      else unlisten = stop;
+    });
+    return () => { disposed = true; unlisten?.(); };
   }, [refresh]);
 
   useEffect(() => {

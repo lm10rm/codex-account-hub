@@ -13,7 +13,7 @@ const scenario = new URLSearchParams(location.search).get('scenario');
 const originalNow = Date.now;
 let offset = 0;
 Date.now = () => originalNow() + offset;
-export const state = { active: scenario === 'recovery' ? null : a, failure: scenario === 'auth-error' ? 'authentication_required' : scenario === 'stale' ? 'network' : scenario === 'recovery' ? 'local_io' : null, listeners: new Map(), mismatch: false, currentQueries: 0, pendingLogin: null, renewed: false, switchCalls: 0, restartCalls: 0, recoveryCalls: 0 };
+export const state = { active: scenario === 'recovery' ? null : a, failure: scenario === 'auth-error' ? 'authentication_required' : scenario === 'stale' ? 'network' : scenario === 'recovery' ? 'local_io' : null, listeners: new Map(), mismatch: false, currentQueries: 0, savedQueries: 0, listCalls: 0, pendingLogin: null, renewed: false, switchCalls: 0, restartCalls: 0, recoveryCalls: 0 };
 export function progress(requestId, phase) {
   for (const callback of state.listeners.get('login-progress') || []) callback({ payload: { requestId, phase } });
 }
@@ -47,6 +47,7 @@ export async function invoke(command, args = {}) {
       return true;
     case 'add_account_with_login': await login(args); return accounts[0];
     case 'list_saved_accounts':
+      state.listCalls++;
       if (state.pendingLogin) await state.pendingLogin;
       return { accounts: accounts.map(a => ({ ...a, isActive: a.id === state.active })), currentAccountId: state.active };
     case 'discover_runtime': return { codexPath: 'fixture', codexHome: 'fixture', codexVersion: 'fixture' };
@@ -62,6 +63,7 @@ export async function invoke(command, args = {}) {
       if (state.failure) throw { code: state.failure, message: state.failure === 'authentication_required' ? '登录失效，请重新授权' : state.failure === 'local_io' ? '当前认证文件损坏，可切换到已保存账号恢复' : '网络连接失败', reauthRequired: state.failure === 'authentication_required' };
       return snapshot(state.active);
     case 'query_saved_usage':
+      state.savedQueries++;
       await new Promise(resolve => setTimeout(resolve, 50));
       return snapshot(state.mismatch ? accounts[0].id : args.accountId);
     case 'reauthorize_account':
@@ -141,7 +143,23 @@ try {
   check(await page.locator("select").inputValue() === "10", "首次默认 10 分钟刷新");
   check(await row("测试账号 A").locator(".quota-heading strong").first().innerText() === "70%", "当前账号额度正确");
 
-  await page.evaluate(() => { window.__hubTest.state.active = window.__hubTest.b; window.dispatchEvent(new Event("focus")); });
+  const beforeFocus = await page.evaluate(() => ({ current: window.__hubTest.state.currentQueries, saved: window.__hubTest.state.savedQueries, list: window.__hubTest.state.listCalls }));
+  await page.evaluate(() => {
+    for (let i = 0; i < 5; i++) {
+      window.dispatchEvent(new Event('blur'));
+      window.dispatchEvent(new Event('focus'));
+      window.dispatchEvent(new Event('resize'));
+      window.__hubTest.emit('tauri://move');
+    }
+  });
+  await page.waitForTimeout(200);
+  check(await page.evaluate(expected => window.__hubTest.state.currentQueries === expected.current && window.__hubTest.state.savedQueries === expected.saved && window.__hubTest.state.listCalls === expected.list, beforeFocus), '拖动相关的网页焦点和移动事件不触发刷新');
+  await page.evaluate(() => { for (let i = 0; i < 5; i++) window.__hubTest.emit('tauri://focus'); });
+  await page.waitForFunction(previous => window.__hubTest.state.listCalls > previous, beforeFocus.list);
+  await page.waitForTimeout(200);
+  check(await page.evaluate(expected => window.__hubTest.state.currentQueries === expected.current && window.__hubTest.state.savedQueries === expected.saved && window.__hubTest.state.listCalls === expected.list + 1, beforeFocus), '重复窗口激活合并身份检查，账号未变不查询额度');
+
+  await page.evaluate(() => { window.__hubTest.state.active = window.__hubTest.b; window.__hubTest.emit('tauri://focus'); });
   await page.waitForFunction(() => document.querySelector(".account-row.active h3")?.textContent === "测试账号 B");
   await settled();
   check(await row("测试账号 B").locator(".quota-heading strong").first().innerText() === "40%", "外部换号后身份与额度同步");
@@ -197,6 +215,8 @@ try {
     await page.waitForFunction(() => !document.querySelector('.login-status') && [...document.querySelectorAll('.notice-bar')].some(el => el.textContent.includes('登录已取消')));
     check(await page.getByRole('button', { name: '添加账号' }).isEnabled(), `${scenario} 取消后解除操作锁定`);
     check(await page.evaluate(() => window.__hubTest.state.active === window.__hubTest.a && window.__hubTest.state.switchCalls === 0), `${scenario} 保留当前账号`);
+    await page.waitForFunction(() => ![...document.querySelectorAll('.notice-bar')].some(el => el.textContent.includes('登录已取消')));
+    check(true, `${scenario} 完成提示自动消失`);
   }
 
   await page.goto(`${base}/?scenario=saving-login`);
@@ -204,6 +224,8 @@ try {
   await page.getByRole('button', { name: '添加账号' }).click();
   await page.waitForFunction(() => document.querySelector('.login-status')?.textContent.includes('正在安全保存账号'));
   check(await page.getByRole('button', { name: '取消登录' }).isDisabled(), '提交保存期间禁止取消');
+  await page.waitForTimeout(5200);
+  check(await page.locator('.login-status').isVisible(), '进行中的登录提示不会被完成提示计时器清除');
   await page.evaluate(() => window.__hubTest.state.resolveLogin());
   await page.waitForFunction(() => !document.querySelector('.login-status'));
   await settled();
@@ -211,10 +233,14 @@ try {
   await page.goto(`${base}/?scenario=startup-recovery`);
   await settled();
   check((await page.locator('.recovery-status').innerText()).includes('请重试恢复'), '启动恢复异常有可操作提示');
+  await page.waitForTimeout(5200);
+  check(await page.locator('.recovery-status.error').isVisible(), '恢复异常不会定时消失');
   await page.getByRole('button', { name: '重试恢复' }).click();
   await page.waitForFunction(() => document.querySelector('.recovery-status')?.textContent.includes('还原上次有效登录'));
   await settled();
   check(await page.evaluate(() => window.__hubTest.state.recoveryCalls === 1 && window.__hubTest.state.restartCalls === 0), '恢复重试成功后不会自动重启');
+  await page.waitForFunction(() => !document.querySelector('.recovery-status'));
+  check(await page.getByRole('button', { name: '重新启动 Codex', exact: true }).isVisible(), '恢复成功提示自动消失，待重启入口仍保留');
 
   await page.goto(`${base}/?scenario=restart-failure`);
   await settled();
@@ -223,11 +249,15 @@ try {
   await page.waitForFunction(() => document.querySelector('.restart-status')?.textContent.includes('重启未完成'));
   await settled();
   check(await page.locator('.account-row.active h3').innerText() === '测试账号 B', '重启失败仍保留切换成功结果');
+  await page.waitForTimeout(5200);
+  check((await page.locator('.restart-status').innerText()).includes('重启未完成'), '重启失败及重试入口持续保留');
   await page.getByRole('button', { name: '重新启动 Codex', exact: true }).click();
   check(await page.evaluate(() => window.__hubTest.state.restartCalls === 0), '单独重启在确认前不执行');
   await page.getByRole('button', { name: '确认重启', exact: true }).click();
   await page.waitForFunction(() => document.querySelector('.restart-status')?.textContent.includes('已检测到 Codex 启动'));
   check(await page.evaluate(() => window.__hubTest.state.switchCalls === 1 && window.__hubTest.state.restartCalls === 1), '重试重启不重复切换账号');
+  await page.waitForFunction(() => !document.querySelector('.restart-status'));
+  check(true, '重启成功提示自动消失');
   assert.deepEqual(errors, [], "浏览器没有未捕获异常");
 } finally {
   await browser?.close();

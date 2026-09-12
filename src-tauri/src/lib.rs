@@ -267,12 +267,12 @@ async fn list_saved_accounts(
     operation_state: tauri::State<'_, OperationState>,
 ) -> Result<AccountList, String> {
     let _guard = operation_state.gate.read().await;
-    let runtime = runtime::discover_runtime()?;
+    let codex_home = runtime::codex_home()?;
     let data_dir = app
         .path()
         .app_data_dir()
         .map_err(|error| error.to_string())?;
-    let active_id = vault::current_account_id(&runtime.codex_home).ok();
+    let active_id = vault::current_account_id(&codex_home).ok();
     let mut accounts = vault::list_accounts(&data_dir)?;
     for account in &mut accounts {
         account.is_active = active_id.as_deref() == Some(account.id.as_str());
