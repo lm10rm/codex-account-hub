@@ -13,7 +13,15 @@ const scenario = new URLSearchParams(location.search).get('scenario');
 const originalNow = Date.now;
 let offset = 0;
 Date.now = () => originalNow() + offset;
-export const state = { active: scenario === 'recovery' ? null : a, failure: scenario === 'auth-error' ? 'authentication_required' : scenario === 'stale' ? 'network' : scenario === 'recovery' ? 'local_io' : null, listeners: new Map(), mismatch: false, currentQueries: 0, pendingLogin: null, renewed: false };
+export const state = { active: scenario === 'recovery' ? null : a, failure: scenario === 'auth-error' ? 'authentication_required' : scenario === 'stale' ? 'network' : scenario === 'recovery' ? 'local_io' : null, listeners: new Map(), mismatch: false, currentQueries: 0, pendingLogin: null, renewed: false, switchCalls: 0, restartCalls: 0, recoveryCalls: 0 };
+export function progress(requestId, phase) {
+  for (const callback of state.listeners.get('login-progress') || []) callback({ payload: { requestId, phase } });
+}
+export async function login(args) {
+  state.loginRequest = args.requestId;
+  progress(args.requestId, scenario === 'saving-login' ? 'saving' : 'waiting');
+  await new Promise((resolve, reject) => { state.resolveLogin = resolve; state.rejectLogin = reject; });
+}
 export const accounts = [
   { id: a, label: '测试账号 A', email: 'a***@example.com', planType: 'plus', importedAt: 1 },
   { id: b, label: '测试账号 B', email: 'b***@example.com', planType: 'plus', importedAt: 1 },
@@ -26,9 +34,18 @@ export function snapshot(id, old = false) {
 window.__hubTest = { a, b, state, advance: ms => offset += ms, emit: event => { for (const callback of state.listeners.get(event) || []) callback({}); } };
 `;
 const core = `
-import { state, accounts, snapshot } from 'virtual:hub-fixtures';
+import { state, accounts, snapshot, login } from 'virtual:hub-fixtures';
 export async function invoke(command, args = {}) {
+  const scenario = new URLSearchParams(location.search).get('scenario');
   switch (command) {
+    case 'recovery_status': return { messages: scenario === 'startup-recovery' ? ['恢复记录暂时无法处理，请重试恢复'] : [], needsAttention: scenario === 'startup-recovery', restartSuggested: false };
+    case 'retry_recovery': state.recoveryCalls++; return { messages: ['已从加密恢复记录还原上次有效登录。'], needsAttention: false, restartSuggested: true };
+    case 'restart_codex': state.restartCalls++; return { succeeded: true, warning: null };
+    case 'cancel_login':
+      if (args.requestId !== state.loginRequest || scenario === 'saving-login') return false;
+      setTimeout(() => state.rejectLogin('登录已取消'), 30);
+      return true;
+    case 'add_account_with_login': await login(args); return accounts[0];
     case 'list_saved_accounts':
       if (state.pendingLogin) await state.pendingLogin;
       return { accounts: accounts.map(a => ({ ...a, isActive: a.id === state.active })), currentAccountId: state.active };
@@ -48,6 +65,7 @@ export async function invoke(command, args = {}) {
       await new Promise(resolve => setTimeout(resolve, 50));
       return snapshot(state.mismatch ? accounts[0].id : args.accountId);
     case 'reauthorize_account':
+      if (scenario === 'cancel-reauth') await login(args);
       if (state.releaseQuery) {
         state.pendingLogin = new Promise(resolve => setTimeout(resolve, 100));
         state.releaseQuery();
@@ -58,8 +76,8 @@ export async function invoke(command, args = {}) {
       state.failure = null;
       return { account: accounts.find(a => a.id === args.accountId), currentAuthUpdated: args.accountId === state.active };
     case 'switch_saved_account':
-      state.active = args.accountId; state.failure = null;
-      return { account: accounts.find(a => a.id === args.accountId), restartRequested: args.restartCodex, restartSucceeded: false, codexWasRunning: false, processesClosed: 0, restartWarning: null };
+      state.switchCalls++; state.active = args.accountId; state.failure = null;
+      return { account: accounts.find(a => a.id === args.accountId), restartRequested: args.restartCodex, restartSucceeded: false, codexWasRunning: false, processesClosed: 0, restartWarning: scenario === 'restart-failure' ? '未检测到 Codex 启动' : null };
     case 'update_tray_current_account': return;
     default: throw new Error('Unexpected test command: ' + command);
   }
@@ -138,7 +156,7 @@ try {
   await settled();
   check((await row("测试账号 A").locator(".account-error").innerText()).includes("登录失效"), "首次查询失败在当前卡片显示错误");
   await row("测试账号 A").getByRole("button", { name: "重新授权", exact: true }).click();
-  await page.waitForFunction(() => document.querySelector(".notice-bar")?.textContent.includes("当前登录和保险库已更新"));
+  await page.waitForFunction(() => [...document.querySelectorAll(".notice-bar")].some(el => el.textContent.includes("当前登录和保险库已更新")));
   await settled();
   check(await row("测试账号 A").locator(".quota-heading strong").first().innerText() === "70%", "重新授权完成后自动刷新并恢复额度");
 
@@ -167,6 +185,49 @@ try {
   await settled();
   check((await row("测试账号 B").locator(".account-error").innerText()).includes("额度与账号不一致"), "错误归属的响应被拒绝");
   check(await row("测试账号 B").locator(".quota-heading strong").first().innerText() === "40%", "错误归属响应不覆盖已有额度");
+  for (const scenario of ['cancel-login', 'cancel-reauth']) {
+    await page.goto(`${base}/?scenario=${scenario}`);
+    await settled();
+    if (scenario === 'cancel-login') await page.getByRole('button', { name: '添加账号' }).click();
+    else {
+      await row('测试账号 A').getByRole('button', { name: '测试账号 A 更多操作' }).click();
+      await row('测试账号 A').getByRole('button', { name: /重新授权/ }).click();
+    }
+    await page.getByRole('button', { name: '取消登录' }).click();
+    await page.waitForFunction(() => !document.querySelector('.login-status') && [...document.querySelectorAll('.notice-bar')].some(el => el.textContent.includes('登录已取消')));
+    check(await page.getByRole('button', { name: '添加账号' }).isEnabled(), `${scenario} 取消后解除操作锁定`);
+    check(await page.evaluate(() => window.__hubTest.state.active === window.__hubTest.a && window.__hubTest.state.switchCalls === 0), `${scenario} 保留当前账号`);
+  }
+
+  await page.goto(`${base}/?scenario=saving-login`);
+  await settled();
+  await page.getByRole('button', { name: '添加账号' }).click();
+  await page.waitForFunction(() => document.querySelector('.login-status')?.textContent.includes('正在安全保存账号'));
+  check(await page.getByRole('button', { name: '取消登录' }).isDisabled(), '提交保存期间禁止取消');
+  await page.evaluate(() => window.__hubTest.state.resolveLogin());
+  await page.waitForFunction(() => !document.querySelector('.login-status'));
+  await settled();
+
+  await page.goto(`${base}/?scenario=startup-recovery`);
+  await settled();
+  check((await page.locator('.recovery-status').innerText()).includes('请重试恢复'), '启动恢复异常有可操作提示');
+  await page.getByRole('button', { name: '重试恢复' }).click();
+  await page.waitForFunction(() => document.querySelector('.recovery-status')?.textContent.includes('还原上次有效登录'));
+  await settled();
+  check(await page.evaluate(() => window.__hubTest.state.recoveryCalls === 1 && window.__hubTest.state.restartCalls === 0), '恢复重试成功后不会自动重启');
+
+  await page.goto(`${base}/?scenario=restart-failure`);
+  await settled();
+  await row('测试账号 B').getByRole('button', { name: '切换并重启', exact: true }).click();
+  await page.getByRole('dialog').getByRole('button', { name: '切换并重启', exact: true }).click();
+  await page.waitForFunction(() => document.querySelector('.restart-status')?.textContent.includes('重启未完成'));
+  await settled();
+  check(await page.locator('.account-row.active h3').innerText() === '测试账号 B', '重启失败仍保留切换成功结果');
+  await page.getByRole('button', { name: '重新启动 Codex', exact: true }).click();
+  check(await page.evaluate(() => window.__hubTest.state.restartCalls === 0), '单独重启在确认前不执行');
+  await page.getByRole('button', { name: '确认重启', exact: true }).click();
+  await page.waitForFunction(() => document.querySelector('.restart-status')?.textContent.includes('已检测到 Codex 启动'));
+  check(await page.evaluate(() => window.__hubTest.state.switchCalls === 1 && window.__hubTest.state.restartCalls === 1), '重试重启不重复切换账号');
   assert.deepEqual(errors, [], "浏览器没有未捕获异常");
 } finally {
   await browser?.close();

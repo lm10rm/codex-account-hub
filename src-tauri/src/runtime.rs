@@ -11,11 +11,16 @@ pub struct RuntimeInfo {
     pub codex_version: Option<String>,
 }
 
-pub fn discover_runtime() -> Result<RuntimeInfo, String> {
-    let codex_home = env::var_os("CODEX_HOME")
+pub fn codex_home() -> Result<String, String> {
+    let home = env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("USERPROFILE").map(|value| PathBuf::from(value).join(".codex")))
         .ok_or_else(|| "无法确定 Codex Home：缺少 USERPROFILE".to_string())?;
+    Ok(home.to_string_lossy().into_owned())
+}
+
+pub fn discover_runtime() -> Result<RuntimeInfo, String> {
+    let codex_home = codex_home()?;
 
     let codex_path = discover_codex_path()?;
     let codex_version = Command::new(&codex_path)
@@ -28,7 +33,7 @@ pub fn discover_runtime() -> Result<RuntimeInfo, String> {
 
     Ok(RuntimeInfo {
         codex_path: codex_path.to_string_lossy().into_owned(),
-        codex_home: codex_home.to_string_lossy().into_owned(),
+        codex_home,
         codex_version,
     })
 }

@@ -99,6 +99,7 @@ pub fn delete_account(
         .ok_or_else(|| "找不到这个保险库账号".to_string())?;
     let runtime_path = data_dir.join("runtime").join(account_id);
     if runtime_path.exists() {
+        crate::recovery::ensure_idle(&runtime_path)?;
         remove_plain_auth(&runtime_path)?;
         fs::remove_dir_all(&runtime_path)
             .map_err(|error| format!("无法清理账号运行目录：{error}"))?;
@@ -129,9 +130,11 @@ pub fn delete_account(
 }
 
 pub fn prepare_isolated_home(data_dir: &Path, account_id: &str) -> Result<PathBuf, String> {
-    let auth = load_saved_auth(data_dir, account_id)?;
-
+    validate_account_id(account_id)?;
     let home = data_dir.join("runtime").join(account_id);
+    crate::recovery::ensure_idle(&home)?;
+    finish_isolated_home(data_dir, account_id, &home)?;
+    let auth = load_saved_auth(data_dir, account_id)?;
     fs::create_dir_all(&home).map_err(|error| format!("无法创建隔离运行目录：{error}"))?;
     atomic_write(&home.join("auth.json"), &auth)?;
     Ok(home)
@@ -142,7 +145,7 @@ pub fn activate_account(data_dir: &Path, account_id: &str, codex_home: &str) -> 
     replace_current_auth(data_dir, codex_home, &target_auth, account_id, false)
 }
 
-fn read_optional_auth(codex_home: &str) -> Result<Option<Vec<u8>>, String> {
+pub(crate) fn read_optional_auth(codex_home: &str) -> Result<Option<Vec<u8>>, String> {
     let auth_path = Path::new(codex_home).join("auth.json");
     match fs::read(auth_path) {
         Ok(auth) => Ok(Some(auth)),
@@ -196,11 +199,16 @@ pub fn complete_reauthorization(
     )
     .map_err(|error| {
         if is_current {
-            format!("当前登录已更新，但保险库保存失败，请重新导入当前账号：{error}")
+            format!("当前登录已更新，但保险库保存失败，请点击检查并恢复：{error}")
         } else {
             error
         }
     })?;
+    if is_current {
+        crate::recovery::finish(data_dir).map_err(|error| {
+            format!("授权已更新，但恢复记录清理失败，请点击检查并恢复：{error}")
+        })?;
+    }
     Ok((saved, is_current))
 }
 
@@ -237,6 +245,7 @@ fn replace_current_auth_verified(
     require_same_account: bool,
     verify: impl FnOnce(&Path) -> Result<(), String>,
 ) -> Result<(), String> {
+    crate::recovery::ensure_no_pending(data_dir)?;
     validate_auth(target_auth)?;
     if auth_identity(target_auth)? != account_id {
         return Err("保存的凭据与目标账号不一致，已取消写入".into());
@@ -272,7 +281,19 @@ fn replace_current_auth_verified(
         return Err("当前登录已发生变化，已取消写入，请重试".into());
     }
 
-    replace_auth_file(&auth_path, target_auth)?;
+    crate::recovery::begin(
+        data_dir,
+        codex_home,
+        target_auth,
+        account_id,
+        current_auth.clone(),
+    )?;
+    if let Err(error) = replace_auth_file(&auth_path, target_auth) {
+        if read_optional_auth(codex_home).ok() == Some(current_auth.clone()) {
+            let _ = crate::recovery::finish(data_dir);
+        }
+        return Err(error);
+    }
     let verification = verify(&auth_path);
     if let Err(error) = verification {
         let recovery = match &current_auth {
@@ -280,13 +301,22 @@ fn replace_current_auth_verified(
             None => fs::remove_file(&auth_path).map_err(|error| error.to_string()),
         };
         recovery.map_err(|recovery| format!("{error}；恢复原认证失败：{recovery}"))?;
+        crate::recovery::finish(data_dir)
+            .map_err(|error| format!("原认证已恢复，但恢复记录清理失败：{error}"))?;
         return Err(format!("{error}；已恢复原认证状态"));
     }
-    Ok(())
+    // Reauthorization keeps its journal until both the main login and vault are committed.
+    if require_same_account {
+        Ok(())
+    } else {
+        crate::recovery::finish(data_dir)
+            .map_err(|error| format!("认证已更新，但恢复记录清理失败，请重试恢复：{error}"))
+    }
 }
 
 pub fn finish_isolated_home(data_dir: &Path, account_id: &str, home: &Path) -> Result<(), String> {
     validate_account_id(account_id)?;
+    crate::recovery::ensure_idle(home)?;
     let auth_path = home.join("auth.json");
     if !auth_path.exists() {
         return Ok(());
@@ -305,40 +335,15 @@ pub fn finish_isolated_home(data_dir: &Path, account_id: &str, home: &Path) -> R
             &encrypted,
         )
     })();
-    let cleanup_result =
-        fs::remove_file(&auth_path).map_err(|error| format!("无法清理临时认证文件：{error}"));
-
-    match (update_result, cleanup_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-        (Err(update_error), Err(cleanup_error)) => Err(format!("{update_error}；{cleanup_error}")),
-    }
+    // Keep refreshed credentials available for recovery if the encrypted write fails.
+    update_result?;
+    fs::remove_file(&auth_path).map_err(|error| format!("无法清理临时认证文件：{error}"))
 }
 
 pub fn remove_plain_auth(home: &Path) -> Result<(), String> {
     let auth_path = home.join("auth.json");
     if auth_path.exists() {
         fs::remove_file(&auth_path).map_err(|error| format!("无法清理临时认证文件：{error}"))?;
-    }
-    Ok(())
-}
-
-pub fn cleanup_stale_login_auth(data_dir: &Path) -> Result<(), String> {
-    let login_root = data_dir.join("login");
-    if !login_root.exists() {
-        return Ok(());
-    }
-    for entry in
-        fs::read_dir(&login_root).map_err(|error| format!("无法检查隔离登录目录：{error}"))?
-    {
-        let entry = entry.map_err(|error| format!("无法读取隔离登录目录项：{error}"))?;
-        if entry
-            .file_type()
-            .map_err(|error| format!("无法检查隔离登录目录项：{error}"))?
-            .is_dir()
-        {
-            remove_plain_auth(&entry.path())?;
-        }
     }
     Ok(())
 }
@@ -355,6 +360,9 @@ pub fn import_current(
     validate_auth(&auth)?;
 
     let id = auth_identity(&auth)?;
+    // Settle an older isolated query before committing an explicit login/import.
+    // Otherwise startup cleanup could later overwrite this authorization with its stale copy.
+    finish_isolated_home(data_dir, &id, &data_dir.join("runtime").join(&id))?;
     let encrypted = protect(&auth)?;
     let vault_dir = data_dir.join("vault");
     fs::create_dir_all(&vault_dir).map_err(|error| format!("无法创建账号保险库：{error}"))?;
@@ -397,7 +405,7 @@ pub fn import_current(
     Ok(saved)
 }
 
-fn validate_auth(bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn validate_auth(bytes: &[u8]) -> Result<(), String> {
     let value: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|_| "当前 auth.json 不是有效 JSON".to_string())?;
     let has_access_token = value
@@ -411,7 +419,7 @@ fn validate_auth(bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn auth_identity(bytes: &[u8]) -> Result<String, String> {
+pub(crate) fn auth_identity(bytes: &[u8]) -> Result<String, String> {
     let value: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
     let stable_value = value
@@ -504,7 +512,7 @@ fn prune_switch_backups(data_dir: &Path, keep: usize) -> Result<(), String> {
     Ok(())
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::fs::OpenOptions;
     use std::io::Write;
 
@@ -563,7 +571,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn replace_auth_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn replace_auth_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::fs::OpenOptions;
     use std::io::Write;
     use std::os::windows::ffi::OsStrExt;
@@ -609,7 +617,7 @@ fn replace_auth_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
-fn replace_auth_file(_path: &Path, _bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn replace_auth_file(_path: &Path, _bytes: &[u8]) -> Result<(), String> {
     Err("账号切换当前只支持 Windows".to_string())
 }
 
@@ -621,7 +629,7 @@ fn now_seconds() -> u64 {
 }
 
 #[cfg(windows)]
-fn protect(plaintext: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn protect(plaintext: &[u8]) -> Result<Vec<u8>, String> {
     use std::ptr;
     use windows_sys::Win32::Foundation::{GetLastError, LocalFree};
     use windows_sys::Win32::Security::Cryptography::{
@@ -659,7 +667,7 @@ fn protect(plaintext: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 #[cfg(windows)]
-fn unprotect(ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn unprotect(ciphertext: &[u8]) -> Result<Vec<u8>, String> {
     use std::ptr;
     use windows_sys::Win32::Foundation::{GetLastError, LocalFree};
     use windows_sys::Win32::Security::Cryptography::{
@@ -697,12 +705,12 @@ fn unprotect(ciphertext: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 #[cfg(not(windows))]
-fn protect(_plaintext: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn protect(_plaintext: &[u8]) -> Result<Vec<u8>, String> {
     Err("账号保险库当前只支持 Windows DPAPI".to_string())
 }
 
 #[cfg(not(windows))]
-fn unprotect(_ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn unprotect(_ciphertext: &[u8]) -> Result<Vec<u8>, String> {
     Err("账号保险库当前只支持 Windows DPAPI".to_string())
 }
 
@@ -750,6 +758,45 @@ mod tests {
     const NEW: &[u8] = br#"{"tokens":{"access_token":"fixture-renewed","account_id":"fixture-a"}}"#;
     #[cfg(windows)]
     const OTHER: &[u8] = br#"{"tokens":{"access_token":"fixture-other","account_id":"fixture-b"}}"#;
+
+    #[cfg(windows)]
+    #[test]
+    fn interrupted_reauthorization_recovers_vault_before_next_switch() {
+        let fixture = Fixture::new();
+        let main = fixture.home("main", OLD);
+        let account = import_current(&fixture.0, main.to_str().unwrap(), None, None).unwrap();
+        let isolated = prepare_isolated_home(&fixture.0, &account.id).unwrap();
+        replace_current_auth(&fixture.0, main.to_str().unwrap(), NEW, &account.id, true).unwrap();
+        assert_eq!(load_saved_auth(&fixture.0, &account.id).unwrap(), OLD);
+        assert!(activate_account(&fixture.0, &account.id, main.to_str().unwrap()).is_err());
+        let report = crate::recovery::run(&fixture.0, Ok(main.to_str().unwrap().into()));
+        assert!(!report.needs_attention);
+        assert_eq!(load_saved_auth(&fixture.0, &account.id).unwrap(), NEW);
+        assert_eq!(fs::read(main.join("auth.json")).unwrap(), NEW);
+        assert!(!isolated.join("auth.json").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_vault_write_preserves_refreshed_auth_until_query_retry() {
+        let fixture = Fixture::new();
+        let main = fixture.home("main", OLD);
+        let account = import_current(&fixture.0, main.to_str().unwrap(), None, None).unwrap();
+        let isolated = prepare_isolated_home(&fixture.0, &account.id).unwrap();
+        fs::write(isolated.join("auth.json"), NEW).unwrap();
+        let blocked = fixture
+            .0
+            .join("vault")
+            .join(format!(".{}.dpapi.tmp", account.id));
+        fs::create_dir(&blocked).unwrap();
+        assert!(finish_isolated_home(&fixture.0, &account.id, &isolated).is_err());
+        assert!(prepare_isolated_home(&fixture.0, &account.id).is_err());
+        assert_eq!(fs::read(isolated.join("auth.json")).unwrap(), NEW);
+        fs::remove_dir(blocked).unwrap();
+        prepare_isolated_home(&fixture.0, &account.id).unwrap();
+        assert_eq!(load_saved_auth(&fixture.0, &account.id).unwrap(), NEW);
+        assert_eq!(fs::read(isolated.join("auth.json")).unwrap(), NEW);
+    }
 
     #[cfg(windows)]
     #[test]

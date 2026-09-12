@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { AccountList, LimitWindow, ReauthorizationOutcome, RuntimeInfo, SavedAccount, SwitchOutcome, UsageSnapshot } from "./types";
+import type { AccountList, LimitWindow, LoginProgress, RecoveryReport, RestartResult, ReauthorizationOutcome, RuntimeInfo, SavedAccount, SwitchOutcome, UsageSnapshot } from "./types";
 import { isSnapshotStale, parseAutoRefresh, snapshotForAccount } from "./dashboard-state";
 import type { AutoRefreshMinutes } from "./dashboard-state";
 
@@ -145,7 +145,7 @@ function ConfirmDialog({ dialog, renameValue, busy, onRenameValue, onCancel, onC
           <p>{isDelete
             ? "只会删除这台电脑中的加密副本，不会注销线上账号。删除后若要再次使用，需要重新添加。"
             : dialog.restartCodex
-              ? "应用会先加密保存当前账号，然后关闭所有 Codex 窗口、切换登录并重新启动。正在执行的任务会被中断。"
+              ? "应用会先备份并切换登录，然后关闭所有 Codex 窗口并重新启动。正在执行的任务会被中断。"
               : "应用会替换本机 Codex 登录，但不会关闭当前窗口。稍后需要手动重启 Codex 才能完全生效。"}</p>
         )}
         <div className="dialog-actions">
@@ -189,6 +189,43 @@ export default function App() {
   const [vaultError, setVaultError] = useState<string | null>(null);
   const [vaultNotice, setVaultNotice] = useState<string | null>(null);
   const [now, setNow] = useState(Date.now());
+  const [loginProgress, setLoginProgress] = useState<LoginProgress | null>(null);
+  const [recoveryReport, setRecoveryReport] = useState<RecoveryReport | null>(null);
+  const [recovering, setRecovering] = useState(false);
+  const [restartNeeded, setRestartNeeded] = useState(false);
+  const [restarting, setRestarting] = useState(false);
+  const [restartDialog, setRestartDialog] = useState(false);
+  const [restartMessage, setRestartMessage] = useState<string | null>(null);
+
+  useEffect(() => {
+    void invoke<RecoveryReport>("recovery_status").then((report) => {
+      setRecoveryReport(report);
+      if (report.restartSuggested) setRestartNeeded(true);
+    }).catch((reason) => setRecoveryReport({ messages: [errorText(reason)], needsAttention: true, restartSuggested: false }));
+  }, []);
+
+  const runLogin = useCallback(async <T,>(command: string, args: Record<string, unknown>): Promise<T> => {
+    const requestId = crypto.randomUUID();
+    setLoginProgress({ requestId, phase: "starting" });
+    let unlisten: (() => void) | undefined;
+    try {
+      unlisten = await listen<LoginProgress>("login-progress", ({ payload }) => {
+        if (payload.requestId === requestId) setLoginProgress(payload);
+      });
+      return await invoke<T>(command, { ...args, requestId });
+    } finally {
+      unlisten?.();
+      setLoginProgress(null);
+    }
+  }, []);
+
+  const cancelLogin = async () => {
+    if (!loginProgress) return;
+    try {
+      const cancelled = await invoke<boolean>("cancel_login", { requestId: loginProgress.requestId });
+      if (cancelled) setLoginProgress((current) => current ? { ...current, phase: "cancelling" } : null);
+    } catch (reason) { setVaultError(errorText(reason)); }
+  };
 
   const reconcileAccounts = useCallback(async () => {
     const listing = await invoke<AccountList>("list_saved_accounts");
@@ -221,11 +258,12 @@ export default function App() {
       if (event.key === "Escape") {
         setOpenMenu(null);
         if (!switchingAccount && !managingAccount) setDialog(null);
+        if (!restarting) setRestartDialog(false);
       }
     };
     window.addEventListener("keydown", handleEscape);
     return () => window.removeEventListener("keydown", handleEscape);
-  }, [managingAccount, switchingAccount]);
+  }, [managingAccount, switchingAccount, restarting]);
 
   const refreshSavedAccounts = useCallback(async (accounts: SavedAccount[]) => {
     const outcomes: Record<string, UsageError | null> = {};
@@ -380,20 +418,24 @@ export default function App() {
   const addAccount = useCallback(async () => {
     setAddingAccount(true); setVaultError(null); setVaultNotice(null);
     try {
-      await invoke<SavedAccount>("add_account_with_login", { label: null });
+      await runLogin<SavedAccount>("add_account_with_login", { label: null });
       setVaultNotice("新账号已添加并安全保存。");
       await refresh(true);
-    } catch (reason) { setVaultError(errorText(reason)); }
+    } catch (reason) {
+      if (errorText(reason) === "登录已取消") setVaultNotice("登录已取消，临时认证已清理。");
+      else setVaultError(errorText(reason));
+    }
     finally { setAddingAccount(false); }
-  }, [refresh]);
+  }, [refresh, runLogin]);
 
   const executeSwitch = useCallback(async (account: SavedAccount, restartCodex: boolean) => {
-    setSwitchingAccount(account.id); setVaultError(null); setVaultNotice(null);
+    setSwitchingAccount(account.id); setVaultError(null); setVaultNotice(null); setRestartMessage(null);
     try {
       const outcome = await invoke<SwitchOutcome>("switch_saved_account", { accountId: account.id, restartCodex });
-      if (outcome.restartWarning) setVaultError(outcome.restartWarning);
-      else if (outcome.restartSucceeded) setVaultNotice(`已切换到 ${outcome.account.label}，Codex 已重新启动。`);
-      else setVaultNotice(`已切换到 ${outcome.account.label}，请稍后手动重启 Codex。`);
+      setVaultNotice(`账号已切换到 ${outcome.account.label}。`);
+      setRestartNeeded(!outcome.restartSucceeded);
+      setRestartMessage(outcome.restartSucceeded ? "已检测到 Codex 启动。" : outcome.restartWarning
+        ? `账号已切换，Codex 重启未完成：${outcome.restartWarning}` : "当前登录已更新，可在方便时重启 Codex。");
       setSnapshot(null);
       await refresh(true);
     } catch (reason) { setVaultError(errorText(reason)); }
@@ -414,15 +456,40 @@ export default function App() {
     setOpenMenu(null);
     setManagingAccount(account.id); setVaultError(null); setVaultNotice(null);
     try {
-      const outcome = await invoke<ReauthorizationOutcome>("reauthorize_account", { accountId: account.id });
+      const outcome = await runLogin<ReauthorizationOutcome>("reauthorize_account", { accountId: account.id });
       backgroundFailures.current.delete(account.id);
       setVaultNotice(outcome.currentAuthUpdated
         ? `${account.label} 的当前登录和保险库已更新。请在方便时重启 Codex，让桌面端使用新授权。`
         : `${account.label} 的保险库凭据已更新。切换到该账号后即可使用新授权。`);
+      if (outcome.currentAuthUpdated) { setRestartNeeded(true); setRestartMessage(null); }
       await refresh(true);
-    } catch (reason) { setVaultError(errorText(reason)); }
+    } catch (reason) {
+      if (errorText(reason) === "登录已取消") setVaultNotice("登录已取消，原账号保持不变。");
+      else setVaultError(errorText(reason));
+    }
     finally { setManagingAccount(null); }
-  }, [refresh]);
+  }, [refresh, runLogin]);
+
+  const retryRecovery = async () => {
+    setRecovering(true);
+    try {
+      const report = await invoke<RecoveryReport>("retry_recovery");
+      setRecoveryReport(report.messages.length ? report : { ...report, messages: ["恢复检查完成，没有待处理的问题。"] });
+      if (report.restartSuggested) setRestartNeeded(true);
+      await refresh(true);
+    } catch (reason) { setRecoveryReport({ messages: [errorText(reason)], needsAttention: true, restartSuggested: false }); }
+    finally { setRecovering(false); }
+  };
+
+  const executeRestart = async () => {
+    setRestarting(true);
+    try {
+      const result = await invoke<RestartResult>("restart_codex");
+      setRestartNeeded(!result.succeeded);
+      setRestartMessage(result.succeeded ? "已检测到 Codex 启动，账号认证保持不变。" : result.warning ?? "Codex 未能启动，请重试。");
+    } catch (reason) { setRestartNeeded(true); setRestartMessage(errorText(reason)); }
+    finally { setRestarting(false); setRestartDialog(false); }
+  };
 
   const executeDelete = useCallback(async (account: SavedAccount) => {
     setManagingAccount(account.id); setVaultError(null);
@@ -463,7 +530,7 @@ export default function App() {
 
   const sortedAccounts = useMemo(() => [...savedAccounts].sort((left, right) => Number(right.isActive) - Number(left.isActive)), [savedAccounts]);
   const activeAccount = sortedAccounts.find((account) => account.isActive) ?? null;
-  const operationBusy = importing || addingAccount || switchingAccount !== null || managingAccount !== null;
+  const operationBusy = importing || addingAccount || switchingAccount !== null || managingAccount !== null || recovering || restarting;
   operationBusyRef.current = operationBusy;
   const currentSnapshot = snapshotForAccount(snapshot, currentAccountId);
   const currentName = activeAccount?.label ?? currentSnapshot?.account?.email ?? "未识别当前账号";
@@ -564,11 +631,28 @@ export default function App() {
         <div className="summary-meta"><span>{savedAccounts.length} 个账号</span><span className="divider" /><span>{runtime?.codexVersion ?? "Codex runtime"}</span></div>
       </section>
 
-      {(vaultNotice || vaultError || error || addingAccount) && (
+      {loginProgress && <section className="notice-bar login-status" role="status">
+        <span>↗</span><p>{{ starting: "正在准备登录…", queued: "正在等待当前操作结束…", waiting: "请在官方页面完成登录。", verifying: "正在验证登录账号…", saving: "正在安全保存账号，请稍候…", cancelling: "正在取消登录并清理临时认证…" }[loginProgress.phase]}</p>
+        <button onClick={() => void cancelLogin()} disabled={["starting", "saving", "cancelling"].includes(loginProgress.phase)}>取消登录</button>
+      </section>}
+
+      {recoveryReport && recoveryReport.messages.length > 0 && <section className={`notice-bar recovery-status ${recoveryReport.needsAttention ? "error" : ""}`} role="status">
+        <span>{recoveryReport.needsAttention ? "!" : "✓"}</span><p>{recoveryReport.messages.join(" ")}</p>
+        <button disabled={operationBusy} onClick={() => void retryRecovery()}>{recovering ? "正在恢复…" : "重试恢复"}</button>
+        {!recoveryReport.needsAttention && <button onClick={() => setRecoveryReport(null)}>关闭提示</button>}
+      </section>}
+
+      {(restartNeeded || restartMessage) && <section className="notice-bar restart-status" role="status">
+        <span>↻</span><p>{restartMessage ?? "当前登录已更新，请在方便时重启 Codex。"}</p>
+        {restartNeeded && <button onClick={() => setRestartDialog(true)} disabled={operationBusy}>重新启动 Codex</button>}
+      </section>}
+
+      {(vaultNotice || vaultError || error) && (
         <section className={`notice-bar ${vaultError || error ? "error" : ""}`}>
           <span>{vaultError || error ? "!" : addingAccount ? "↗" : "✓"}</span>
           <p>{vaultError ?? error ?? (addingAccount ? "请在刚打开的官方页面完成登录，当前 Codex 账号不会被切换。" : vaultNotice)}</p>
-          {(vaultError || error) && <button onClick={() => void refresh()}>重试</button>}
+          {(vaultError || error) && <button disabled={operationBusy} onClick={() => void refresh()}>重试</button>}
+          {vaultError && <button disabled={operationBusy} onClick={() => void retryRecovery()}>检查并恢复</button>}
         </section>
       )}
 
@@ -621,6 +705,10 @@ export default function App() {
 
       <footer className="app-footer"><span><span className="status-dot" /> 本地安全读取</span><span>关闭窗口后驻留系统托盘</span></footer>
       {dialog && <ConfirmDialog dialog={dialog} renameValue={renameValue} busy={switchingAccount !== null || managingAccount !== null} onRenameValue={setRenameValue} onCancel={() => { if (!switchingAccount && !managingAccount) setDialog(null); }} onConfirm={() => void confirmDialog()} />}
+      {restartDialog && <div className="dialog-backdrop"><section className="dialog-panel" role="dialog" aria-modal="true" aria-labelledby="restart-title">
+        <h2 id="restart-title">重新启动 Codex？</h2><p>将关闭 Codex 窗口并中断正在执行的任务。当前账号认证不会再次切换。</p>
+        <div className="dialog-actions"><button className="button ghost" disabled={restarting} onClick={() => setRestartDialog(false)}>取消</button><button className="button primary" disabled={restarting} onClick={() => void executeRestart()}>{restarting ? "正在重启…" : "确认重启"}</button></div>
+      </section></div>}
     </main>
   );
 }

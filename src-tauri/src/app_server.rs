@@ -39,10 +39,30 @@ pub struct LimitWindow {
 }
 
 pub async fn query_usage(codex_path: &str, codex_home: &str) -> Result<UsageSnapshot, String> {
+    query_usage_owned(codex_path, codex_home, false).await
+}
+
+pub async fn query_usage_owned(
+    codex_path: &str,
+    codex_home: &str,
+    isolated: bool,
+) -> Result<UsageSnapshot, String> {
     query_for_home(codex_home, async {
         let mut process = AppServerProcess::start(codex_path, codex_home).await?;
+        if isolated {
+            if let Err(error) = crate::recovery::record_child(
+                std::path::Path::new(codex_home),
+                process.child.id().ok_or("查询进程已退出")?,
+            ) {
+                let _ = process.stop().await;
+                return Err(error);
+            }
+        }
         let result = process.query().await;
-        process.stop().await;
+        process.stop().await?;
+        if isolated {
+            crate::recovery::clear_child(std::path::Path::new(codex_home))?;
+        }
         result
     })
     .await
@@ -184,13 +204,15 @@ impl AppServerProcess {
         .map_err(|_| "App Server 请求超时".to_string())?
     }
 
-    async fn stop(&mut self) {
+    async fn stop(&mut self) -> Result<(), String> {
         let _ = self.stdin.shutdown().await;
-        if timeout(Duration::from_millis(800), self.child.wait())
-            .await
-            .is_err()
-        {
-            let _ = self.child.kill().await;
+        match timeout(Duration::from_millis(800), self.child.wait()).await {
+            Ok(Ok(_)) => Ok(()),
+            _ => self
+                .child
+                .kill()
+                .await
+                .map_err(|error| format!("无法确认查询进程退出：{error}")),
         }
     }
 }

@@ -31,18 +31,41 @@ pub fn restart() -> Result<RestartOutcome, String> {
     if !remaining.is_empty() {
         thread::sleep(Duration::from_millis(900));
     }
+    if !discover_processes()?.is_empty() {
+        return Err("Codex 仍有进程未退出，请关闭窗口后重试启动".into());
+    }
 
     let mut command = Command::new("explorer.exe");
     command.arg(format!("shell:AppsFolder\\{app_id}"));
     command.creation_flags_no_window();
     command
         .spawn()
-        .map_err(|error| format!("账号已切换，但无法重新启动 Codex：{error}"))?;
+        .map_err(|error| format!("无法重新启动 Codex：{error}"))?;
+
+    wait_for_start(
+        || discover_processes().map(|processes| !processes.is_empty()),
+        || thread::sleep(Duration::from_millis(500)),
+        20,
+    )?;
 
     Ok(RestartOutcome {
         was_running: !initial.is_empty(),
         processes_closed: initial.len(),
     })
+}
+
+fn wait_for_start(
+    mut running: impl FnMut() -> Result<bool, String>,
+    mut pause: impl FnMut(),
+    attempts: usize,
+) -> Result<(), String> {
+    for _ in 0..attempts {
+        if running()? {
+            return Ok(());
+        }
+        pause();
+    }
+    Err("启动请求已发送，但未检测到 Codex 进程，请重试启动或从开始菜单打开".into())
 }
 
 #[cfg(not(windows))]
@@ -191,6 +214,24 @@ impl CommandWindowsExt for std::process::Command {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verifies_launch_instead_of_only_accepting_shell_request() {
+        assert!(wait_for_start(|| Ok(false), || {}, 3).is_err());
+        let mut polls = 0;
+        assert!(
+            wait_for_start(
+                || {
+                    polls += 1;
+                    Ok(polls == 2)
+                },
+                || {},
+                3
+            )
+            .is_ok()
+        );
+        assert!(wait_for_start(|| Err("fixture discovery failure".into()), || {}, 3).is_err());
+    }
 
     #[test]
     #[ignore = "requires a running Codex desktop app"]

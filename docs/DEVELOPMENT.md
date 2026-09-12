@@ -49,6 +49,8 @@ Rust 测试中有一项真实 Codex 进程检测测试默认忽略，避免测�
 
 账号恢复测试使用独立临时目录和假凭据，覆盖当前账号重新授权、授权后切换往返、外部换号、错误账号拒绝覆盖、主认证缺失或损坏恢复，以及缓存身份校验。
 
+0.7 的故障测试还覆盖事务中断、加密写回失败后的重试、遗留进程保护、登录取消与超时。子进程测试仅启动隐藏的测试 PowerShell 等待进程，不执行真实 Codex 登录或重启。界面回归覆盖取消后解锁、保存阶段禁止取消、启动恢复提示和重启重试不重复切换。
+
 另有生产前端的浏览器回归测试，使用虚拟 Tauri IPC 和假数据，不启动真实 Tauri 或读取用户认证：
 
 ```powershell
@@ -99,6 +101,8 @@ src-tauri/src/
   app_server.rs           Codex App Server JSON-RPC
   runtime.rs              Codex 与 Codex Home 发现
   vault.rs                DPAPI 账号保险库与安全切换
+  login.rs                登录生命周期与取消
+  recovery.rs             加密事务及临时认证恢复
   codex_desktop.rs        Codex 桌面进程关闭与重启
   lib.rs                  Tauri commands 与操作互斥
 ```

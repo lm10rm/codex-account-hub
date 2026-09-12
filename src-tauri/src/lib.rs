@@ -1,5 +1,7 @@
 mod app_server;
 mod codex_desktop;
+mod login;
+mod recovery;
 mod runtime;
 mod usage_cache;
 mod vault;
@@ -8,14 +10,59 @@ use app_server::UsageSnapshot;
 use runtime::RuntimeInfo;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager};
 use tokio::process::Command;
-use tokio::time::timeout;
 use usage_cache::UsageCache;
 use vault::SavedAccount;
 
 const MAX_CONCURRENT_USAGE_QUERIES: usize = 3;
+
+struct RecoveryState(Mutex<recovery::Report>);
+
+#[tauri::command]
+fn recovery_status(state: tauri::State<'_, RecoveryState>) -> Result<recovery::Report, String> {
+    state
+        .0
+        .lock()
+        .map(|report| report.clone())
+        .map_err(|_| "恢复状态不可用".into())
+}
+
+#[tauri::command]
+async fn retry_recovery(
+    app: tauri::AppHandle,
+    operation_state: tauri::State<'_, OperationState>,
+    state: tauri::State<'_, RecoveryState>,
+) -> Result<recovery::Report, String> {
+    let _guard = operation_state.gate.write().await;
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
+    let report = recovery::run(&data_dir, runtime::codex_home());
+    *state.0.lock().map_err(|_| "恢复状态不可用")? = report.clone();
+    Ok(report)
+}
+
+#[tauri::command]
+fn cancel_login(
+    state: tauri::State<'_, Arc<login::LoginState>>,
+    request_id: String,
+) -> Result<bool, String> {
+    state.cancel(&request_id)
+}
+
+fn login_phase(
+    app: &tauri::AppHandle,
+    session: &login::Session,
+    phase: &'static str,
+) -> Result<(), String> {
+    let progress = session.phase(phase)?;
+    let _ = app.emit("login-progress", progress);
+    Ok(())
+}
 
 struct OperationState {
     gate: tokio::sync::RwLock<()>,
@@ -53,6 +100,31 @@ struct SwitchOutcome {
 struct ReauthorizationOutcome {
     account: SavedAccount,
     current_auth_updated: bool,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RestartResult {
+    succeeded: bool,
+    warning: Option<String>,
+}
+
+#[tauri::command]
+async fn restart_codex(
+    operation_state: tauri::State<'_, OperationState>,
+) -> Result<RestartResult, String> {
+    let _guard = operation_state.gate.write().await;
+    let result = perform_restart().await;
+    Ok(RestartResult {
+        succeeded: result.is_ok(),
+        warning: result.err(),
+    })
+}
+
+async fn perform_restart() -> Result<codex_desktop::RestartOutcome, String> {
+    tokio::task::spawn_blocking(codex_desktop::restart)
+        .await
+        .map_err(|_| "Codex 重启任务异常，请重试启动".to_string())?
 }
 
 #[derive(serde::Serialize)]
@@ -249,11 +321,12 @@ async fn query_saved_usage(
         .app_data_dir()
         .map_err(|error| error.to_string())?;
     let isolated_home = vault::prepare_isolated_home(&data_dir, &account_id)?;
-    let query_result = app_server::query_usage(
+    let query_result = app_server::query_usage_owned(
         &runtime.codex_path,
         isolated_home
             .to_str()
             .ok_or_else(|| "隔离运行目录不是有效路径".to_string())?,
+        true,
     )
     .await;
     let cleanup_result = vault::finish_isolated_home(&data_dir, &account_id, &isolated_home);
@@ -277,8 +350,12 @@ async fn add_account_with_login(
     app: tauri::AppHandle,
     operation_state: tauri::State<'_, OperationState>,
     label: Option<String>,
+    login_state: tauri::State<'_, Arc<login::LoginState>>,
+    request_id: String,
 ) -> Result<SavedAccount, String> {
-    let _guard = operation_state.gate.write().await;
+    let session = login_state.begin(request_id)?;
+    login_phase(&app, &session, "queued")?;
+    let _guard = session.wait(operation_state.gate.write()).await?;
     let runtime = runtime::discover_runtime()?;
     let data_dir = app
         .path()
@@ -287,18 +364,27 @@ async fn add_account_with_login(
     let login_home = create_login_home(&data_dir)?;
 
     let operation = async {
-        run_interactive_login(&runtime.codex_path, &login_home).await?;
+        login_phase(&app, &session, "waiting")?;
+        run_interactive_login(&runtime.codex_path, &login_home, &session).await?;
         let home_text = login_home
             .to_str()
             .ok_or_else(|| "隔离登录目录不是有效路径".to_string())?;
-        let account = app_server::query_usage(&runtime.codex_path, home_text)
-            .await
+        login_phase(&app, &session, "verifying")?;
+        let account = session
+            .wait(app_server::query_usage_owned(
+                &runtime.codex_path,
+                home_text,
+                true,
+            ))
+            .await?
             .ok()
             .and_then(|snapshot| snapshot.account);
+        recovery::ensure_idle(&login_home)?;
+        login_phase(&app, &session, "saving")?;
         vault::import_current(&data_dir, home_text, account, label)
     }
     .await;
-    let cleanup = vault::remove_plain_auth(&login_home);
+    let cleanup = recovery::cleanup_login(&login_home).await;
 
     match (operation, cleanup) {
         (Ok(account), Ok(())) => Ok(account),
@@ -314,8 +400,12 @@ async fn reauthorize_account(
     app: tauri::AppHandle,
     operation_state: tauri::State<'_, OperationState>,
     account_id: String,
+    login_state: tauri::State<'_, Arc<login::LoginState>>,
+    request_id: String,
 ) -> Result<ReauthorizationOutcome, String> {
-    let _guard = operation_state.gate.write().await;
+    let session = login_state.begin(request_id)?;
+    login_phase(&app, &session, "queued")?;
+    let _guard = session.wait(operation_state.gate.write()).await?;
     let runtime = runtime::discover_runtime()?;
     let data_dir = app
         .path()
@@ -330,7 +420,8 @@ async fn reauthorize_account(
     let login_home = create_login_home(&data_dir)?;
 
     let operation = async {
-        run_interactive_login(&runtime.codex_path, &login_home).await?;
+        login_phase(&app, &session, "waiting")?;
+        run_interactive_login(&runtime.codex_path, &login_home, &session).await?;
         let logged_in_id = vault::isolated_account_id(&login_home)?;
         if logged_in_id != account_id {
             return Err("登录的不是所选账号，已取消覆盖；请用该账号重新登录".to_string());
@@ -338,10 +429,18 @@ async fn reauthorize_account(
         let home_text = login_home
             .to_str()
             .ok_or_else(|| "隔离登录目录不是有效路径".to_string())?;
-        let account = app_server::query_usage(&runtime.codex_path, home_text)
-            .await
+        login_phase(&app, &session, "verifying")?;
+        let account = session
+            .wait(app_server::query_usage_owned(
+                &runtime.codex_path,
+                home_text,
+                true,
+            ))
+            .await?
             .ok()
             .and_then(|snapshot| snapshot.account);
+        recovery::ensure_idle(&login_home)?;
+        login_phase(&app, &session, "saving")?;
         let (account, current_auth_updated) = vault::complete_reauthorization(
             &data_dir,
             &runtime.codex_home,
@@ -355,7 +454,7 @@ async fn reauthorize_account(
         })
     }
     .await;
-    let cleanup = vault::remove_plain_auth(&login_home);
+    let cleanup = recovery::cleanup_login(&login_home).await;
     combine_operation_and_cleanup(operation, cleanup)
 }
 
@@ -425,9 +524,7 @@ async fn switch_saved_account(
         });
     }
 
-    let restart_result = tokio::task::spawn_blocking(codex_desktop::restart)
-        .await
-        .map_err(|error| format!("账号已切换，但 Codex 重启任务异常：{error}"))?;
+    let restart_result = perform_restart().await;
     match restart_result {
         Ok(restart) => Ok(SwitchOutcome {
             account,
@@ -477,6 +574,7 @@ fn combine_operation_and_cleanup<T>(
 async fn run_interactive_login(
     codex_path: &str,
     login_home: &std::path::Path,
+    session: &login::Session,
 ) -> Result<(), String> {
     let mut command = Command::new(codex_path);
     command
@@ -491,18 +589,18 @@ async fn run_interactive_login(
         .spawn()
         .map_err(|error| format!("无法启动 Codex 官方登录：{error}"))?;
 
-    let status = match timeout(Duration::from_secs(600), child.wait()).await {
-        Ok(result) => result.map_err(|error| format!("等待 Codex 登录失败：{error}"))?,
-        Err(_) => {
-            let _ = child.kill().await;
-            return Err("登录等待已超过 10 分钟，请重试".to_string());
-        }
-    };
-    if status.success() {
-        Ok(())
-    } else {
-        Err("Codex 登录未完成或已取消".to_string())
+    if let Err(error) = recovery::record_child(login_home, child.id().ok_or("登录进程已退出")?)
+    {
+        let _ = child.kill().await;
+        return Err(error);
     }
+    let result = session
+        .wait_child(&mut child, Duration::from_secs(600))
+        .await;
+    if child.try_wait().ok().flatten().is_some() {
+        recovery::clear_child(login_home)?;
+    }
+    result
 }
 
 trait LoginCommandWindowsExt {
@@ -622,9 +720,13 @@ pub fn run() {
             show_main_window(app);
         }))
         .manage(OperationState::default())
+        .manage(Arc::new(login::LoginState::default()))
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
-            vault::cleanup_stale_login_auth(&data_dir).map_err(std::io::Error::other)?;
+            app.manage(RecoveryState(Mutex::new(recovery::run(
+                &data_dir,
+                runtime::codex_home(),
+            ))));
             app.manage(UsageCache::load(&data_dir));
             setup_tray(app)?;
             start_background_clock(app.handle());
@@ -642,6 +744,10 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             discover_runtime,
+            recovery_status,
+            retry_recovery,
+            cancel_login,
+            restart_codex,
             update_tray_current_account,
             load_usage_cache,
             query_current_usage,

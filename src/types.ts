@@ -54,3 +54,19 @@ export interface ReauthorizationOutcome {
   account: SavedAccount;
   currentAuthUpdated: boolean;
 }
+
+export interface RecoveryReport {
+  messages: string[];
+  needsAttention: boolean;
+  restartSuggested: boolean;
+}
+
+export interface RestartResult {
+  succeeded: boolean;
+  warning: string | null;
+}
+
+export interface LoginProgress {
+  requestId: string;
+  phase: "starting" | "queued" | "waiting" | "verifying" | "saving" | "cancelling";
+}
