@@ -12,6 +12,7 @@ export interface LimitWindow {
 }
 
 export interface UsageSnapshot {
+  accountId: string;
   account: AccountInfo | null;
   primary: LimitWindow | null;
   secondary: LimitWindow | null;
@@ -42,4 +43,14 @@ export interface SwitchOutcome {
   codexWasRunning: boolean;
   processesClosed: number;
   restartWarning: string | null;
+}
+
+export interface AccountList {
+  accounts: SavedAccount[];
+  currentAccountId: string | null;
+}
+
+export interface ReauthorizationOutcome {
+  account: SavedAccount;
+  currentAuthUpdated: boolean;
 }

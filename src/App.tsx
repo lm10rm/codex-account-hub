@@ -1,14 +1,15 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { LimitWindow, RuntimeInfo, SavedAccount, SwitchOutcome, UsageSnapshot } from "./types";
+import type { AccountList, LimitWindow, ReauthorizationOutcome, RuntimeInfo, SavedAccount, SwitchOutcome, UsageSnapshot } from "./types";
+import { isSnapshotStale, parseAutoRefresh, snapshotForAccount } from "./dashboard-state";
+import type { AutoRefreshMinutes } from "./dashboard-state";
 
 type LoadState = "idle" | "loading" | "ready" | "error";
 type Theme = "light" | "dark";
-type AutoRefreshMinutes = 0 | 10 | 30 | 60;
-type UsageErrorCode = "authentication_required" | "timeout" | "runtime_unavailable" | "network" | "app_server" | "local_io" | "unknown";
+type UsageErrorCode = "authentication_required" | "account_changed" | "timeout" | "runtime_unavailable" | "network" | "app_server" | "local_io" | "unknown";
 type UsageError = { code: UsageErrorCode; message: string; reauthRequired: boolean };
-type SavedUsageState = { state: LoadState; snapshot: UsageSnapshot | null; error: UsageError | null };
+type SavedUsageState = { state: LoadState; snapshot: UsageSnapshot | null; error: UsageError | null; cached?: boolean };
 type DialogState =
   | { type: "switch"; account: SavedAccount; restartCodex: boolean }
   | { type: "delete"; account: SavedAccount }
@@ -36,12 +37,12 @@ function errorLabel(error: UsageError) {
   if (error.code === "runtime_unavailable") return "Codex 不可用";
   if (error.code === "network") return "网络异常";
   if (error.code === "local_io") return "本地文件异常";
+  if (error.code === "account_changed") return "账号已变化";
   return "读取失败";
 }
 
 function initialAutoRefresh(): AutoRefreshMinutes {
-  const saved = Number(window.localStorage.getItem("codex-account-hub-auto-refresh"));
-  return saved === 0 || saved === 10 || saved === 30 || saved === 60 ? saved : 10;
+  return parseAutoRefresh(window.localStorage.getItem("codex-account-hub-auto-refresh"));
 }
 
 function formatWindow(minutes: number | null) {
@@ -164,13 +165,14 @@ export default function App() {
   const [snapshot, setSnapshot] = useState<UsageSnapshot | null>(null);
   const [state, setState] = useState<LoadState>("idle");
   const [error, setError] = useState<string | null>(null);
-  const [currentUsageError, setCurrentUsageError] = useState<UsageError | null>(null);
+  const [currentAccountId, setCurrentAccountId] = useState<string | null>(null);
   const [autoRefreshMinutes, setAutoRefreshMinutes] = useState<AutoRefreshMinutes>(initialAutoRefresh);
   const [savedAccounts, setSavedAccounts] = useState<SavedAccount[]>([]);
   const [savedUsage, setSavedUsage] = useState<Record<string, SavedUsageState>>({});
   const [refreshingVault, setRefreshingVault] = useState(false);
   const cacheHydrated = useRef(false);
   const fullRefreshInFlight = useRef(false);
+  const pendingOperationRefresh = useRef(false);
   const vaultRefreshInFlight = useRef(false);
   const backgroundRefreshInFlight = useRef(false);
   const backgroundFailures = useRef(new Map<string, { failures: number; nextAllowedAt: number }>());
@@ -187,6 +189,14 @@ export default function App() {
   const [vaultError, setVaultError] = useState<string | null>(null);
   const [vaultNotice, setVaultNotice] = useState<string | null>(null);
   const [now, setNow] = useState(Date.now());
+
+  const reconcileAccounts = useCallback(async () => {
+    const listing = await invoke<AccountList>("list_saved_accounts");
+    setCurrentAccountId(listing.currentAccountId);
+    setSavedAccounts(listing.accounts);
+    setSnapshot((previous) => snapshotForAccount(previous, listing.currentAccountId));
+    return listing;
+  }, []);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -224,13 +234,14 @@ export default function App() {
     setRefreshingVault(true);
     setSavedUsage((previous) => {
       const next = { ...previous };
-      for (const account of accounts) next[account.id] = { state: "loading", snapshot: previous[account.id]?.snapshot ?? null, error: null };
+      for (const account of accounts) next[account.id] = { ...previous[account.id], state: "loading", snapshot: previous[account.id]?.snapshot ?? null, error: null };
       return next;
     });
     try {
       await Promise.all(accounts.map(async (account) => {
         try {
           const usage = await invoke<UsageSnapshot>("query_saved_usage", { accountId: account.id });
+          if (!snapshotForAccount(usage, account.id)) throw { code: "account_changed", message: "额度与账号不一致，请重新刷新", reauthRequired: false };
           setSavedUsage((previous) => ({ ...previous, [account.id]: { state: "ready", snapshot: usage, error: null } }));
           backgroundFailures.current.delete(account.id);
           outcomes[account.id] = null;
@@ -247,105 +258,121 @@ export default function App() {
     return outcomes;
   }, []);
 
-  const refresh = useCallback(async () => {
-    if (fullRefreshInFlight.current || vaultRefreshInFlight.current) return;
-    fullRefreshInFlight.current = true;
+  const refreshCurrentUsage = useCallback(async (expectedId: string | null): Promise<UsageError | null> => {
     setState("loading");
     setError(null);
-    setCurrentUsageError(null);
-    const cachedUsage = cacheHydrated.current
-      ? Promise.resolve<Record<string, UsageSnapshot> | null>(null)
-      : invoke<Record<string, UsageSnapshot>>("load_usage_cache").catch(() => null);
-    cacheHydrated.current = true;
-    const runtimeAndUsage = Promise.allSettled([
-      invoke<RuntimeInfo>("discover_runtime"),
-      invoke<UsageSnapshot>("query_current_usage"),
-    ]);
-    let savedRefresh: Promise<Record<string, UsageError | null>> = Promise.resolve({});
-    try {
-      let savedResult: PromiseSettledResult<SavedAccount[]>;
-      try {
-        const accounts = await invoke<SavedAccount[]>("list_saved_accounts");
-        savedResult = { status: "fulfilled", value: accounts };
-        setSavedAccounts(accounts);
-        const cached = await cachedUsage;
-        if (cached) {
-          setSavedUsage((previous) => {
-            const next = { ...previous };
-            for (const account of accounts) {
-              const cachedSnapshot = cached[account.id];
-              const current = previous[account.id];
-              if (cachedSnapshot && (!current?.snapshot || cachedSnapshot.capturedAt > current.snapshot.capturedAt)) {
-                next[account.id] = { state: "ready", snapshot: cachedSnapshot, error: null };
-              }
-            }
-            return next;
-          });
-          const active = accounts.find((account) => account.isActive);
-          const activeSnapshot = active ? cached[active.id] : null;
-          if (activeSnapshot) {
-            setSnapshot((current) => !current || activeSnapshot.capturedAt > current.capturedAt ? activeSnapshot : current);
-          }
-        }
-        savedRefresh = refreshSavedAccounts(accounts.filter((account) => !account.isActive));
-      } catch (reason) {
-        savedResult = { status: "rejected", reason };
-      }
-
-      const [runtimeResult, usageResult] = await runtimeAndUsage;
-      if (runtimeResult.status === "fulfilled") setRuntime(runtimeResult.value);
-      if (usageResult.status === "fulfilled") setSnapshot(usageResult.value);
-      if (usageResult.status === "fulfilled" && savedResult.status === "fulfilled") {
-        const active = savedResult.value.find((account) => account.isActive);
-        if (active) backgroundFailures.current.delete(active.id);
-      }
-      setCurrentUsageError(usageResult.status === "rejected" ? usageError(usageResult.reason) : null);
-      const failures = [runtimeResult, usageResult, savedResult]
-        .filter((result): result is PromiseRejectedResult => result.status === "rejected")
-        .map((result) => errorText(result.reason));
-      setError(failures.length ? failures.join("；") : null);
-      setState(usageResult.status === "fulfilled" ? "ready" : "error");
-      await savedRefresh;
-    } finally {
-      fullRefreshInFlight.current = false;
-      const interval = autoRefreshMinutesRef.current;
-      if (interval > 0) nextBackgroundRefreshAt.current = Date.now() + interval * 60_000;
-    }
-  }, [refreshSavedAccounts]);
-
-  const refreshAccount = useCallback(async (account: SavedAccount): Promise<UsageError | null> => {
-    if (!account.isActive) {
-      const outcomes = await refreshSavedAccounts([account]);
-      return outcomes[account.id] ?? null;
-    }
-    if (fullRefreshInFlight.current || vaultRefreshInFlight.current) return null;
-    fullRefreshInFlight.current = true;
-    setState("loading");
-    setError(null);
-    setCurrentUsageError(null);
+    if (expectedId) setSavedUsage((previous) => ({ ...previous, [expectedId]: {
+      ...previous[expectedId], state: "loading", snapshot: previous[expectedId]?.snapshot ?? null, error: null,
+    } }));
     try {
       const usage = await invoke<UsageSnapshot>("query_current_usage");
-      setSnapshot(usage);
-      backgroundFailures.current.delete(account.id);
+      const listing = await reconcileAccounts();
+      setSavedUsage((previous) => {
+        const next = { ...previous, [usage.accountId]: { state: "ready" as const, snapshot: usage, error: null } };
+        if (expectedId && expectedId !== usage.accountId && next[expectedId]?.state === "loading") {
+          next[expectedId] = { ...next[expectedId], state: next[expectedId].snapshot ? "ready" : "idle" };
+        }
+        return next;
+      });
+      setSnapshot(snapshotForAccount(usage, listing.currentAccountId));
+      backgroundFailures.current.delete(usage.accountId);
       setState("ready");
       return null;
     } catch (reason) {
       const queryError = usageError(reason);
       setError(queryError.message);
-      setCurrentUsageError(queryError);
+      setState("error");
+      if (expectedId) setSavedUsage((previous) => ({ ...previous, [expectedId]: {
+        state: "error", snapshot: previous[expectedId]?.snapshot ?? null, error: queryError,
+      } }));
+      await reconcileAccounts().catch(() => undefined);
+      return queryError;
+    }
+  }, [reconcileAccounts]);
+
+  const refresh = useCallback(async (afterOperation = false): Promise<void> => {
+    if (fullRefreshInFlight.current || vaultRefreshInFlight.current) {
+      if (afterOperation) pendingOperationRefresh.current = true;
+      return;
+    }
+    if (!afterOperation && operationBusyRef.current) return;
+    fullRefreshInFlight.current = true;
+    setState("loading");
+    setError(null);
+    const cachedUsage = cacheHydrated.current
+      ? Promise.resolve<Record<string, UsageSnapshot> | null>(null)
+      : invoke<Record<string, UsageSnapshot>>("load_usage_cache").catch(() => null);
+    cacheHydrated.current = true;
+    try {
+      const listing = await reconcileAccounts();
+      const accounts = listing.accounts;
+      const cached = await cachedUsage;
+      if (cached) {
+        setSavedUsage((previous) => {
+          const next = { ...previous };
+          for (const account of accounts) {
+            const cachedSnapshot = cached[account.id];
+            const current = previous[account.id];
+            if (cachedSnapshot && (!current?.snapshot || cachedSnapshot.capturedAt > current.snapshot.capturedAt)) {
+              next[account.id] = { state: "ready", snapshot: cachedSnapshot, error: null, cached: true };
+            }
+          }
+          return next;
+        });
+        const activeSnapshot = listing.currentAccountId ? snapshotForAccount(cached[listing.currentAccountId], listing.currentAccountId) : null;
+        if (activeSnapshot) {
+          setSnapshot((current) => !current || activeSnapshot.capturedAt > current.capturedAt ? activeSnapshot : current);
+        }
+      }
+      await Promise.all([
+        invoke<RuntimeInfo>("discover_runtime").then(setRuntime).catch(() => undefined),
+        refreshCurrentUsage(listing.currentAccountId),
+        refreshSavedAccounts(accounts.filter((account) => !account.isActive)),
+      ]);
+    } catch (reason) {
+      setError(errorText(reason));
+      setState("error");
+    } finally {
+      fullRefreshInFlight.current = false;
+      const interval = autoRefreshMinutesRef.current;
+      if (interval > 0) nextBackgroundRefreshAt.current = Date.now() + interval * 60_000;
+      if (pendingOperationRefresh.current) {
+        pendingOperationRefresh.current = false;
+        queueMicrotask(() => void refresh(true));
+      }
+    }
+  }, [reconcileAccounts, refreshCurrentUsage, refreshSavedAccounts]);
+
+  const refreshAccount = useCallback(async (account: SavedAccount): Promise<UsageError | null> => {
+    if (operationBusyRef.current || fullRefreshInFlight.current || vaultRefreshInFlight.current) return null;
+    fullRefreshInFlight.current = true;
+    try {
+      const listing = await reconcileAccounts();
+      const latest = listing.accounts.find((item) => item.id === account.id);
+      if (!latest) return null;
+      if (latest.isActive) return await refreshCurrentUsage(latest.id);
+      const outcomes = await refreshSavedAccounts([latest]);
+      return outcomes[latest.id] ?? null;
+    } catch (reason) {
+      const queryError = usageError(reason);
+      setError(queryError.message);
       setState("error");
       return queryError;
     } finally {
       fullRefreshInFlight.current = false;
+      if (pendingOperationRefresh.current) {
+        pendingOperationRefresh.current = false;
+        queueMicrotask(() => void refresh(true));
+      }
     }
-  }, [refreshSavedAccounts]);
+  }, [reconcileAccounts, refreshCurrentUsage, refreshSavedAccounts, refresh]);
 
   const importCurrent = useCallback(async () => {
     setImporting(true); setVaultError(null); setVaultNotice(null);
     try {
       await invoke<SavedAccount>("import_current_account", { label: null });
       setVaultNotice("当前账号已安全保存。");
-      await refresh();
+      await refresh(true);
     } catch (reason) { setVaultError(errorText(reason)); }
     finally { setImporting(false); }
   }, [refresh]);
@@ -355,7 +382,7 @@ export default function App() {
     try {
       await invoke<SavedAccount>("add_account_with_login", { label: null });
       setVaultNotice("新账号已添加并安全保存。");
-      await refresh();
+      await refresh(true);
     } catch (reason) { setVaultError(errorText(reason)); }
     finally { setAddingAccount(false); }
   }, [refresh]);
@@ -368,7 +395,7 @@ export default function App() {
       else if (outcome.restartSucceeded) setVaultNotice(`已切换到 ${outcome.account.label}，Codex 已重新启动。`);
       else setVaultNotice(`已切换到 ${outcome.account.label}，请稍后手动重启 Codex。`);
       setSnapshot(null);
-      await refresh();
+      await refresh(true);
     } catch (reason) { setVaultError(errorText(reason)); }
     finally { setSwitchingAccount(null); }
   }, [refresh]);
@@ -387,10 +414,12 @@ export default function App() {
     setOpenMenu(null);
     setManagingAccount(account.id); setVaultError(null); setVaultNotice(null);
     try {
-      await invoke<SavedAccount>("reauthorize_account", { accountId: account.id });
+      const outcome = await invoke<ReauthorizationOutcome>("reauthorize_account", { accountId: account.id });
       backgroundFailures.current.delete(account.id);
-      setVaultNotice(`${account.label} 已重新授权。`);
-      await refresh();
+      setVaultNotice(outcome.currentAuthUpdated
+        ? `${account.label} 的当前登录和保险库已更新。请在方便时重启 Codex，让桌面端使用新授权。`
+        : `${account.label} 的保险库凭据已更新。切换到该账号后即可使用新授权。`);
+      await refresh(true);
     } catch (reason) { setVaultError(errorText(reason)); }
     finally { setManagingAccount(null); }
   }, [refresh]);
@@ -436,7 +465,8 @@ export default function App() {
   const activeAccount = sortedAccounts.find((account) => account.isActive) ?? null;
   const operationBusy = importing || addingAccount || switchingAccount !== null || managingAccount !== null;
   operationBusyRef.current = operationBusy;
-  const currentName = activeAccount?.label ?? snapshot?.account?.email ?? "未识别当前账号";
+  const currentSnapshot = snapshotForAccount(snapshot, currentAccountId);
+  const currentName = activeAccount?.label ?? currentSnapshot?.account?.email ?? "未识别当前账号";
 
   const runBackgroundRefresh = useCallback(async () => {
     if (
@@ -449,7 +479,8 @@ export default function App() {
 
     backgroundRefreshInFlight.current = true;
     try {
-      for (const account of sortedAccounts) {
+      const listing = await reconcileAccounts();
+      for (const account of [...listing.accounts].sort((left, right) => Number(right.isActive) - Number(left.isActive))) {
         if (operationBusyRef.current || fullRefreshInFlight.current || vaultRefreshInFlight.current) break;
         const backoff = backgroundFailures.current.get(account.id);
         if (backoff && backoff.nextAllowedAt > Date.now()) continue;
@@ -465,10 +496,20 @@ export default function App() {
           : Math.min(6 * 60 * 60_000, 10 * 60_000 * 2 ** (failures - 1));
         backgroundFailures.current.set(account.id, { failures, nextAllowedAt: Date.now() + delay });
       }
+    } catch (reason) {
+      setError(errorText(reason));
     } finally {
       backgroundRefreshInFlight.current = false;
     }
-  }, [refreshAccount, sortedAccounts]);
+  }, [reconcileAccounts, refreshAccount]);
+
+  useEffect(() => {
+    const onFocus = () => {
+      if (!operationBusyRef.current && !backgroundRefreshInFlight.current) void refresh();
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [refresh]);
 
   useEffect(() => {
     let disposed = false;
@@ -519,7 +560,7 @@ export default function App() {
       </header>
 
       <section className="summary-bar">
-        <div className={`summary-current ${snapshot?.account ? "" : "unknown"}`}><span className="status-dot" /><span>当前</span><strong>{currentName}</strong><span className="plan-label">{activeAccount?.planType?.toUpperCase() ?? snapshot?.account?.planType?.toUpperCase() ?? "UNKNOWN"}</span></div>
+        <div className={`summary-current ${currentAccountId ? "" : "unknown"}`}><span className="status-dot" /><span>当前</span><strong>{currentName}</strong><span className="plan-label">{currentSnapshot?.account?.planType?.toUpperCase() ?? activeAccount?.planType?.toUpperCase() ?? "UNKNOWN"}</span></div>
         <div className="summary-meta"><span>{savedAccounts.length} 个账号</span><span className="divider" /><span>{runtime?.codexVersion ?? "Codex runtime"}</span></div>
       </section>
 
@@ -545,14 +586,12 @@ export default function App() {
         ) : (
           <div className="account-list">
             {sortedAccounts.map((account) => {
-              const storedUsage = savedUsage[account.id];
-              const usage: SavedUsageState = account.isActive && snapshot
-                ? { state: state === "loading" ? "loading" : currentUsageError ? "error" : "ready", snapshot, error: currentUsageError }
-                : storedUsage ?? { state: account.isActive && state === "loading" ? "loading" : "idle", snapshot: null, error: null };
+              const usage: SavedUsageState = savedUsage[account.id] ?? { state: account.isActive && state === "loading" ? "loading" : "idle", snapshot: null, error: null };
+              const stale = isSnapshotStale(usage.snapshot, now);
               return (
                 <article className={`account-row ${account.isActive ? "active" : ""}`} key={account.id}>
                   <div className="account-row-heading">
-                    <div className="account-identity"><div className="avatar">{account.label.trim().charAt(0).toUpperCase() || "C"}</div><div><div className="account-title"><h3>{account.label}</h3>{account.isActive && <span className="active-badge">当前账号</span>}</div><div className="account-subtitle"><span>{account.planType?.toUpperCase() ?? "UNKNOWN PLAN"}</span><span className={`sync-state ${usage.state}`}>{usage.state === "loading" ? "刷新中" : usage.state === "error" ? usage.snapshot ? "缓存数据" : usage.error ? errorLabel(usage.error) : "读取失败" : usage.state === "ready" ? "已同步" : "等待刷新"}</span><span>{formatCapturedAt(usage.snapshot?.capturedAt ?? null)}</span></div></div></div>
+                    <div className="account-identity"><div className="avatar">{account.label.trim().charAt(0).toUpperCase() || "C"}</div><div><div className="account-title"><h3>{account.label}</h3>{account.isActive && <span className="active-badge">当前账号</span>}</div><div className="account-subtitle"><span>{usage.snapshot?.account?.planType?.toUpperCase() ?? account.planType?.toUpperCase() ?? "UNKNOWN PLAN"}</span><span className={`sync-state ${stale ? "stale" : usage.state}`}>{usage.state === "loading" ? "刷新中" : usage.state === "error" ? usage.snapshot ? "缓存数据" : usage.error ? errorLabel(usage.error) : "读取失败" : usage.cached ? "缓存数据" : usage.state === "ready" ? "已同步" : "等待刷新"}{stale ? " · 数据陈旧" : ""}</span><span>{formatCapturedAt(usage.snapshot?.capturedAt ?? null)}</span></div></div></div>
                     <div className="account-actions">
                       {!account.isActive && <button className="button switch-primary" onClick={() => setDialog({ type: "switch", account, restartCodex: true })} disabled={operationBusy}>{switchingAccount === account.id ? "正在切换…" : "切换并重启"}</button>}
                       <div className="menu-wrap" onClick={(event) => event.stopPropagation()}>

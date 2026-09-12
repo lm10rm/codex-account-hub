@@ -1,6 +1,6 @@
 {
   "name": "codex-account-hub",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "private": true,
   "type": "module",
   "description": "Local-first Codex account usage dashboard and safe account switcher.",
@@ -12,6 +12,7 @@
     "desktop:build": "tauri build",
     "probe": "node scripts/probe-app-server.mjs",
     "test": "node --test",
+    "test:ui": "node scripts/dashboard-ui-check.mjs",
     "check": "node --check scripts/probe-app-server.mjs && node --check src/core/app-server-client.mjs && node --check src/core/codex-discovery.mjs"
   },
   "engines": {

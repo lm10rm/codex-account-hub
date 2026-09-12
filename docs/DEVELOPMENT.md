@@ -47,6 +47,16 @@ cargo test --manifest-path src-tauri/Cargo.toml
 
 Rust 测试中有一项真实 Codex 进程检测测试默认忽略，避免测试过程关闭或操作用户正在运行的 Codex。
 
+账号恢复测试使用独立临时目录和假凭据，覆盖当前账号重新授权、授权后切换往返、外部换号、错误账号拒绝覆盖、主认证缺失或损坏恢复，以及缓存身份校验。
+
+另有生产前端的浏览器回归测试，使用虚拟 Tauri IPC 和假数据，不启动真实 Tauri 或读取用户认证：
+
+```powershell
+npm run test:ui
+```
+
+运行浏览器回归需要额外可用的 Playwright 模块，默认使用本机 Microsoft Edge。可设置 `PLAYWRIGHT_MODULE` 为已安装 Playwright 的模块目录，设置 `TEST_BROWSER_CHANNEL` 选择其他已安装浏览器渠道。测试构建仅保存在内存中，不覆盖正式 `dist/`，运行结束自动关闭浏览器和本机测试服务器。
+
 ## 构建 Windows 安装包
 
 ```powershell

@@ -34,6 +34,9 @@ impl UsageCache {
         account_id: String,
         snapshot: UsageSnapshot,
     ) -> Result<(), String> {
+        if snapshot.account_id != account_id {
+            return Err("额度快照与账号不一致，已拒绝缓存".into());
+        }
         let mut snapshots = self.snapshots.lock().await;
         if snapshots
             .get(&account_id)
@@ -67,7 +70,17 @@ fn read_cache(data_dir: &Path) -> Result<HashMap<String, UsageSnapshot>, String>
     if cache.version != CACHE_VERSION {
         return Err(format!("不支持的额度缓存版本：{}", cache.version));
     }
-    Ok(cache.snapshots)
+    Ok(cache
+        .snapshots
+        .into_iter()
+        .filter_map(|(id, mut snapshot)| {
+            // v0.5 caches were already keyed by the hashed account ID.
+            if snapshot.account_id.is_empty() {
+                snapshot.account_id = id.clone();
+            }
+            (snapshot.account_id == id).then_some((id, snapshot))
+        })
+        .collect())
 }
 
 fn write_cache(data_dir: &Path, snapshots: &HashMap<String, UsageSnapshot>) -> Result<(), String> {
@@ -157,6 +170,7 @@ mod tests {
 
     fn snapshot(captured_at: u64) -> UsageSnapshot {
         UsageSnapshot {
+            account_id: "aaaaaaaaaaaaaaaaaaaaaaaa".into(),
             account: Some(AccountInfo {
                 account_type: Some("chatgpt".to_string()),
                 email: Some("a***@example.com".to_string()),
@@ -200,6 +214,42 @@ mod tests {
         fs::write(cache_path(&dir), b"not-json").unwrap();
         assert!(load_snapshots(&dir).is_empty());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn migrates_legacy_snapshot_ids_and_drops_mismatched_entries() {
+        let dir = test_dir("identity-migration");
+        fs::create_dir_all(&dir).unwrap();
+        let mut legacy = serde_json::to_value(snapshot(42)).unwrap();
+        legacy.as_object_mut().unwrap().remove("accountId");
+        fs::write(cache_path(&dir), serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "snapshots": { "aaaaaaaaaaaaaaaaaaaaaaaa": legacy, "bbbbbbbbbbbbbbbbbbbbbbbb": snapshot(43) }
+        })).unwrap()).unwrap();
+        let loaded = read_cache(&dir).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded["aaaaaaaaaaaaaaaaaaaaaaaa"].account_id,
+            "aaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(dir.parent(), Some(std::env::temp_dir().as_path()));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn refuses_to_cache_usage_under_a_different_account() {
+        tauri::async_runtime::block_on(async {
+            let dir = test_dir("wrong-account");
+            let cache = UsageCache::load(&dir);
+            assert!(
+                cache
+                    .store(&dir, "bbbbbbbbbbbbbbbbbbbbbbbb".into(), snapshot(42))
+                    .await
+                    .is_err()
+            );
+            assert!(cache.all().await.is_empty());
+            assert!(!cache_path(&dir).exists());
+        });
     }
 
     #[test]

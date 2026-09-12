@@ -139,31 +139,150 @@ pub fn prepare_isolated_home(data_dir: &Path, account_id: &str) -> Result<PathBu
 
 pub fn activate_account(data_dir: &Path, account_id: &str, codex_home: &str) -> Result<(), String> {
     let target_auth = load_saved_auth(data_dir, account_id)?;
+    replace_current_auth(data_dir, codex_home, &target_auth, account_id, false)
+}
+
+fn read_optional_auth(codex_home: &str) -> Result<Option<Vec<u8>>, String> {
     let auth_path = Path::new(codex_home).join("auth.json");
-    let current_auth = fs::read(&auth_path)
-        .map_err(|error| format!("无法读取当前认证文件 {}：{error}", auth_path.display()))?;
-    validate_auth(&current_auth)?;
-    let current_id = auth_identity(&current_auth)?;
-    if current_id == account_id {
+    match fs::read(auth_path) {
+        Ok(auth) => Ok(Some(auth)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("无法读取当前认证文件：{error}")),
+    }
+}
+
+// A missing/damaged active login must not prevent recovery from the vault.
+// Never import the target's old active credentials over its saved authorization.
+pub fn save_current_before_switch(
+    data_dir: &Path,
+    codex_home: &str,
+    target_id: &str,
+) -> Result<(), String> {
+    if let Some(auth) = read_optional_auth(codex_home)? {
+        if validate_auth(&auth).is_ok()
+            && let Ok(current_id) = auth_identity(&auth)
+            && current_id != target_id
+        {
+            import_current(data_dir, codex_home, None, None)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn complete_reauthorization(
+    data_dir: &Path,
+    codex_home: &str,
+    login_home: &Path,
+    account_id: &str,
+    account: Option<AccountInfo>,
+) -> Result<(SavedAccount, bool), String> {
+    let auth = fs::read(login_home.join("auth.json"))
+        .map_err(|error| format!("无法读取登录认证文件：{error}"))?;
+    validate_auth(&auth)?;
+    if auth_identity(&auth)? != account_id {
+        return Err("登录的不是所选账号，已取消覆盖；请用该账号重新登录".into());
+    }
+    let is_current = current_account_id(codex_home).ok().as_deref() == Some(account_id);
+    if is_current {
+        // Update the active file first: on failure, the vault still matches it.
+        // A subsequent switch must never overwrite new authorization with the old file.
+        replace_current_auth(data_dir, codex_home, &auth, account_id, true)?;
+    }
+    let saved = import_current(
+        data_dir,
+        login_home.to_str().ok_or("隔离登录目录不是有效路径")?,
+        account,
+        None,
+    )
+    .map_err(|error| {
+        if is_current {
+            format!("当前登录已更新，但保险库保存失败，请重新导入当前账号：{error}")
+        } else {
+            error
+        }
+    })?;
+    Ok((saved, is_current))
+}
+
+fn replace_current_auth(
+    data_dir: &Path,
+    codex_home: &str,
+    target_auth: &[u8],
+    account_id: &str,
+    require_same_account: bool,
+) -> Result<(), String> {
+    replace_current_auth_verified(
+        data_dir,
+        codex_home,
+        target_auth,
+        account_id,
+        require_same_account,
+        |path| {
+            let activated = fs::read(path).map_err(|error| format!("无法验证切换结果：{error}"))?;
+            validate_auth(&activated)?;
+            if auth_identity(&activated)? == account_id {
+                Ok(())
+            } else {
+                Err("切换后账号身份不一致".into())
+            }
+        },
+    )
+}
+
+fn replace_current_auth_verified(
+    data_dir: &Path,
+    codex_home: &str,
+    target_auth: &[u8],
+    account_id: &str,
+    require_same_account: bool,
+    verify: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    validate_auth(target_auth)?;
+    if auth_identity(target_auth)? != account_id {
+        return Err("保存的凭据与目标账号不一致，已取消写入".into());
+    }
+    let auth_path = Path::new(codex_home).join("auth.json");
+    let current_auth = read_optional_auth(codex_home)?;
+    if require_same_account
+        && current_auth
+            .as_deref()
+            .and_then(|auth| auth_identity(auth).ok())
+            .as_deref()
+            != Some(account_id)
+    {
+        return Err("当前登录已发生变化，已取消写入，请重试".into());
+    }
+    if current_auth.as_deref() == Some(target_auth) {
         return Ok(());
     }
 
-    let encrypted_backup = protect(&current_auth)?;
-    let backup_path = data_dir
-        .join("switch-backups")
-        .join(format!("{}-{current_id}.dpapi", now_seconds()));
-    atomic_write(&backup_path, &encrypted_backup)?;
-    prune_switch_backups(data_dir, MAX_SWITCH_BACKUPS)?;
-
-    replace_auth_file(&auth_path, &target_auth)?;
-    let activated = fs::read(&auth_path).map_err(|error| format!("无法验证切换结果：{error}"))?;
-    if auth_identity(&activated)? == account_id {
-        return Ok(());
+    if let Some(auth) = &current_auth {
+        let current_id = auth_identity(auth).unwrap_or_else(|_| "unrecognized".into());
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let backup_path = data_dir
+            .join("switch-backups")
+            .join(format!("{}-{nonce}-{current_id}.dpapi", now_seconds()));
+        atomic_write(&backup_path, &protect(auth)?)?;
+        prune_switch_backups(data_dir, MAX_SWITCH_BACKUPS)?;
+    }
+    if read_optional_auth(codex_home)? != current_auth {
+        return Err("当前登录已发生变化，已取消写入，请重试".into());
     }
 
-    replace_auth_file(&auth_path, &current_auth)
-        .map_err(|error| format!("切换验证失败，且恢复原账号失败：{error}"))?;
-    Err("切换验证失败，已恢复原账号".to_string())
+    replace_auth_file(&auth_path, target_auth)?;
+    let verification = verify(&auth_path);
+    if let Err(error) = verification {
+        let recovery = match &current_auth {
+            Some(auth) => replace_auth_file(&auth_path, auth),
+            None => fs::remove_file(&auth_path).map_err(|error| error.to_string()),
+        };
+        recovery.map_err(|recovery| format!("{error}；恢复原认证失败：{recovery}"))?;
+        return Err(format!("{error}；已恢复原认证状态"));
+    }
+    Ok(())
 }
 
 pub fn finish_isolated_home(data_dir: &Path, account_id: &str, home: &Path) -> Result<(), String> {
@@ -177,6 +296,9 @@ pub fn finish_isolated_home(data_dir: &Path, account_id: &str, home: &Path) -> R
         let auth =
             fs::read(&auth_path).map_err(|error| format!("无法读取隔离认证状态：{error}"))?;
         validate_auth(&auth)?;
+        if auth_identity(&auth)? != account_id {
+            return Err("隔离凭据与目标账号不一致，已取消回写".to_string());
+        }
         let encrypted = protect(&auth)?;
         atomic_write(
             &data_dir.join("vault").join(format!("{account_id}.dpapi")),
@@ -330,6 +452,9 @@ fn load_saved_auth(data_dir: &Path, account_id: &str) -> Result<Vec<u8>, String>
         .map_err(|error| format!("无法读取加密账号 {}：{error}", encrypted_path.display()))?;
     let auth = unprotect(&encrypted)?;
     validate_auth(&auth)?;
+    if auth_identity(&auth)? != account_id {
+        return Err("保存的凭据与目标账号不一致".into());
+    }
     Ok(auth)
 }
 
@@ -450,6 +575,7 @@ fn replace_auth_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| "认证文件没有父目录".to_string())?;
+    fs::create_dir_all(parent).map_err(|error| format!("无法创建认证目录：{error}"))?;
     let temp = parent.join(".auth.json.codex-account-hub.tmp");
     if temp.exists() {
         fs::remove_file(&temp).map_err(|error| format!("无法清理旧切换临时文件：{error}"))?;
@@ -583,6 +709,230 @@ fn unprotect(_ciphertext: &[u8]) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    struct Fixture(PathBuf);
+
+    #[cfg(windows)]
+    impl Fixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "codex-hub-recovery-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            Self(root)
+        }
+
+        fn home(&self, name: &str, auth: &[u8]) -> PathBuf {
+            let home = self.0.join(name);
+            fs::create_dir_all(&home).unwrap();
+            fs::write(home.join("auth.json"), auth).unwrap();
+            home
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            assert_eq!(self.0.parent(), Some(std::env::temp_dir().as_path()));
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(windows)]
+    const OLD: &[u8] = br#"{"tokens":{"access_token":"fixture-old","account_id":"fixture-a"}}"#;
+    #[cfg(windows)]
+    const NEW: &[u8] = br#"{"tokens":{"access_token":"fixture-renewed","account_id":"fixture-a"}}"#;
+    #[cfg(windows)]
+    const OTHER: &[u8] = br#"{"tokens":{"access_token":"fixture-other","account_id":"fixture-b"}}"#;
+
+    #[cfg(windows)]
+    #[test]
+    fn restores_original_state_after_post_write_verification_errors() {
+        let fixture = Fixture::new();
+        let target_id = auth_identity(NEW).unwrap();
+        for (index, failure) in [
+            "无法读取认证文件",
+            "当前 auth.json 不是有效 JSON",
+            "身份不一致",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let main = fixture.home(&format!("main-{index}"), OLD);
+            let error = replace_current_auth_verified(
+                &fixture.0,
+                main.to_str().unwrap(),
+                NEW,
+                &target_id,
+                false,
+                |path| {
+                    assert_eq!(fs::read(path).unwrap(), NEW);
+                    Err(failure.to_string())
+                },
+            )
+            .unwrap_err();
+            assert!(error.contains("已恢复原认证状态"));
+            assert_eq!(fs::read(main.join("auth.json")).unwrap(), OLD);
+        }
+        let missing = fixture.0.join("missing");
+        assert!(
+            replace_current_auth_verified(
+                &fixture.0,
+                missing.to_str().unwrap(),
+                NEW,
+                &target_id,
+                false,
+                |_| Err("校验失败".into())
+            )
+            .is_err()
+        );
+        assert!(!missing.join("auth.json").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recovery_failure_keeps_encrypted_backup_and_reports_partial_result() {
+        let fixture = Fixture::new();
+        let main = fixture.home("main", OLD);
+        let target_id = auth_identity(NEW).unwrap();
+        let error = replace_current_auth_verified(
+            &fixture.0,
+            main.to_str().unwrap(),
+            NEW,
+            &target_id,
+            false,
+            |_| {
+                fs::create_dir(main.join(".auth.json.codex-account-hub.tmp")).unwrap();
+                Err("校验读取失败".into())
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("恢复原认证失败"));
+        assert_eq!(fs::read(main.join("auth.json")).unwrap(), NEW);
+        let backup = fs::read_dir(fixture.0.join("switch-backups"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(unprotect(&fs::read(backup.path()).unwrap()).unwrap(), OLD);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reauthorizes_current_account_and_preserves_new_credentials_across_switches() {
+        let fixture = Fixture::new();
+        let main = fixture.home("main", OLD);
+        let login = fixture.home("login", NEW);
+        let other = fixture.home("other", OTHER);
+        let a = import_current(
+            &fixture.0,
+            main.to_str().unwrap(),
+            None,
+            Some("工作".into()),
+        )
+        .unwrap();
+        let b = import_current(&fixture.0, other.to_str().unwrap(), None, None).unwrap();
+        let (saved, updated) =
+            complete_reauthorization(&fixture.0, main.to_str().unwrap(), &login, &a.id, None)
+                .unwrap();
+        assert!(updated);
+        assert_eq!(saved.label, "工作");
+        assert_eq!(fs::read(main.join("auth.json")).unwrap(), NEW);
+        assert_eq!(load_saved_auth(&fixture.0, &a.id).unwrap(), NEW);
+        save_current_before_switch(&fixture.0, main.to_str().unwrap(), &b.id).unwrap();
+        activate_account(&fixture.0, &b.id, main.to_str().unwrap()).unwrap();
+        save_current_before_switch(&fixture.0, main.to_str().unwrap(), &a.id).unwrap();
+        activate_account(&fixture.0, &a.id, main.to_str().unwrap()).unwrap();
+        assert_eq!(fs::read(main.join("auth.json")).unwrap(), NEW);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reauthorizing_saved_account_does_not_replace_an_external_login() {
+        let fixture = Fixture::new();
+        let main = fixture.home("main", OLD);
+        let login = fixture.home("login", NEW);
+        let a = import_current(&fixture.0, main.to_str().unwrap(), None, None).unwrap();
+        fs::write(main.join("auth.json"), OTHER).unwrap();
+        let (_, updated) =
+            complete_reauthorization(&fixture.0, main.to_str().unwrap(), &login, &a.id, None)
+                .unwrap();
+        assert!(!updated);
+        assert_eq!(fs::read(main.join("auth.json")).unwrap(), OTHER);
+        assert_eq!(load_saved_auth(&fixture.0, &a.id).unwrap(), NEW);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wrong_login_and_failed_active_write_do_not_overwrite_vault() {
+        let fixture = Fixture::new();
+        let main = fixture.home("main", OLD);
+        let login = fixture.home("login", OTHER);
+        let a = import_current(&fixture.0, main.to_str().unwrap(), None, None).unwrap();
+        assert!(
+            complete_reauthorization(&fixture.0, main.to_str().unwrap(), &login, &a.id, None)
+                .is_err()
+        );
+        assert_eq!(fs::read(main.join("auth.json")).unwrap(), OLD);
+        assert_eq!(load_saved_auth(&fixture.0, &a.id).unwrap(), OLD);
+        fs::write(login.join("auth.json"), NEW).unwrap();
+        fs::create_dir(main.join(".auth.json.codex-account-hub.tmp")).unwrap();
+        assert!(
+            complete_reauthorization(&fixture.0, main.to_str().unwrap(), &login, &a.id, None)
+                .is_err()
+        );
+        assert_eq!(fs::read(main.join("auth.json")).unwrap(), OLD);
+        assert_eq!(load_saved_auth(&fixture.0, &a.id).unwrap(), OLD);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restores_missing_corrupt_and_same_identity_active_credentials() {
+        let fixture = Fixture::new();
+        let source = fixture.home("source", NEW);
+        let a = import_current(&fixture.0, source.to_str().unwrap(), None, None).unwrap();
+        let missing = fixture.0.join("missing-parent");
+        save_current_before_switch(&fixture.0, missing.to_str().unwrap(), &a.id).unwrap();
+        activate_account(&fixture.0, &a.id, missing.to_str().unwrap()).unwrap();
+        assert_eq!(fs::read(missing.join("auth.json")).unwrap(), NEW);
+        for (name, auth) in [("corrupt", b"not-json".as_slice()), ("same-account", OLD)] {
+            let main = fixture.home(name, auth);
+            save_current_before_switch(&fixture.0, main.to_str().unwrap(), &a.id).unwrap();
+            activate_account(&fixture.0, &a.id, main.to_str().unwrap()).unwrap();
+            assert_eq!(fs::read(main.join("auth.json")).unwrap(), NEW);
+            assert_eq!(load_saved_auth(&fixture.0, &a.id).unwrap(), NEW);
+        }
+        let backups = fs::read_dir(fixture.0.join("switch-backups")).unwrap();
+        assert!(
+            backups
+                .filter_map(Result::ok)
+                .any(|entry| unprotect(&fs::read(entry.path()).unwrap()).unwrap() == b"not-json")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn refuses_unreadable_main_auth_and_mismatched_vault_credentials() {
+        let fixture = Fixture::new();
+        let source = fixture.home("source", NEW);
+        let a = import_current(&fixture.0, source.to_str().unwrap(), None, None).unwrap();
+        let main = fixture.0.join("main");
+        fs::create_dir_all(main.join("auth.json")).unwrap();
+        assert!(save_current_before_switch(&fixture.0, main.to_str().unwrap(), &a.id).is_err());
+        fs::write(
+            fixture.0.join("vault").join(format!("{}.dpapi", a.id)),
+            protect(OTHER).unwrap(),
+        )
+        .unwrap();
+        assert!(activate_account(&fixture.0, &a.id, source.to_str().unwrap()).is_err());
+        assert_eq!(fs::read(source.join("auth.json")).unwrap(), NEW);
+    }
 
     #[test]
     fn rejects_auth_without_access_token() {

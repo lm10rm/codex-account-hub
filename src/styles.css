@@ -311,6 +311,7 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 .credits-block span, .credits-block small { color: var(--muted); font-size: 9px; }
 .credits-block strong { margin: 3px 0; color: var(--secondary); font-size: 22px; }
 .quota-grid.loading { opacity: 0.55; }
+.sync-state.stale { color: var(--warning); }
 
 .empty-state {
   padding: 52px 24px;

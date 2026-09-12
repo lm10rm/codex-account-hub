@@ -48,6 +48,20 @@ struct SwitchOutcome {
     restart_warning: Option<String>,
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReauthorizationOutcome {
+    account: SavedAccount,
+    current_auth_updated: bool,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountList {
+    accounts: Vec<SavedAccount>,
+    current_account_id: Option<String>,
+}
+
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct UsageQueryError {
@@ -59,15 +73,36 @@ struct UsageQueryError {
 impl From<String> for UsageQueryError {
     fn from(message: String) -> Self {
         let normalized = message.to_lowercase();
-        let (code, reauth_required) = if [
+        let (code, reauth_required) = if normalized.contains("查询期间账号已变化") {
+            ("account_changed", false)
+        } else if [
+            "认证文件",
+            "认证目录",
+            "隔离认证",
+            "dpapi",
+            "加密账号",
+            "凭据与目标",
+            "账号索引",
+            "auth.json 不是有效 json",
+            "无法从认证文件识别账号",
+        ]
+        .iter()
+        .any(|keyword| normalized.contains(keyword))
+        {
+            ("local_io", false)
+        } else if [
             "unauthorized",
             "not logged in",
-            "authentication",
+            "authentication failed",
+            "authentication required",
+            "invalid_grant",
+            "refresh_token_reused",
+            "refresh_token_expired",
+            "refresh_token_invalidated",
             "token expired",
             "access token",
             "登录失效",
             "未登录",
-            "认证",
             "401",
         ]
         .iter()
@@ -138,14 +173,11 @@ async fn query_current_usage(
         .await
         .map_err(|_| "额度查询队列已关闭".to_string())?;
     let runtime = runtime::discover_runtime()?;
-    let account_id = vault::current_account_id(&runtime.codex_home).ok();
     let snapshot = app_server::query_usage(&runtime.codex_path, &runtime.codex_home).await?;
-    if let Some(account_id) = account_id {
-        if let Ok(data_dir) = app.path().app_data_dir() {
-            let _ = usage_cache
-                .store(&data_dir, account_id, snapshot.clone())
-                .await;
-        }
+    if let Ok(data_dir) = app.path().app_data_dir() {
+        let _ = usage_cache
+            .store(&data_dir, snapshot.account_id.clone(), snapshot.clone())
+            .await;
     }
     Ok(snapshot)
 }
@@ -161,7 +193,7 @@ async fn load_usage_cache(
 async fn list_saved_accounts(
     app: tauri::AppHandle,
     operation_state: tauri::State<'_, OperationState>,
-) -> Result<Vec<SavedAccount>, String> {
+) -> Result<AccountList, String> {
     let _guard = operation_state.gate.read().await;
     let runtime = runtime::discover_runtime()?;
     let data_dir = app
@@ -173,7 +205,10 @@ async fn list_saved_accounts(
     for account in &mut accounts {
         account.is_active = active_id.as_deref() == Some(account.id.as_str());
     }
-    Ok(accounts)
+    Ok(AccountList {
+        accounts,
+        current_account_id: active_id,
+    })
 }
 
 #[tauri::command]
@@ -279,7 +314,7 @@ async fn reauthorize_account(
     app: tauri::AppHandle,
     operation_state: tauri::State<'_, OperationState>,
     account_id: String,
-) -> Result<SavedAccount, String> {
+) -> Result<ReauthorizationOutcome, String> {
     let _guard = operation_state.gate.write().await;
     let runtime = runtime::discover_runtime()?;
     let data_dir = app
@@ -307,7 +342,17 @@ async fn reauthorize_account(
             .await
             .ok()
             .and_then(|snapshot| snapshot.account);
-        vault::import_current(&data_dir, home_text, account, None)
+        let (account, current_auth_updated) = vault::complete_reauthorization(
+            &data_dir,
+            &runtime.codex_home,
+            &login_home,
+            &account_id,
+            account,
+        )?;
+        Ok(ReauthorizationOutcome {
+            account,
+            current_auth_updated,
+        })
     }
     .await;
     let cleanup = vault::remove_plain_auth(&login_home);
@@ -362,11 +407,7 @@ async fn switch_saved_account(
         .app_data_dir()
         .map_err(|error| error.to_string())?;
 
-    let current_account = app_server::query_usage(&runtime.codex_path, &runtime.codex_home)
-        .await
-        .ok()
-        .and_then(|snapshot| snapshot.account);
-    vault::import_current(&data_dir, &runtime.codex_home, current_account, None)?;
+    vault::save_current_before_switch(&data_dir, &runtime.codex_home, &account_id)?;
     vault::activate_account(&data_dir, &account_id, &runtime.codex_home)?;
     let account = vault::list_accounts(&data_dir)?
         .into_iter()
@@ -626,6 +667,25 @@ mod query_error_tests {
         let auth = UsageQueryError::from("当前 auth.json 不包含 ChatGPT access token".to_string());
         assert_eq!(auth.code, "authentication_required");
         assert!(auth.reauth_required);
+
+        for message in [
+            "无法读取当前认证文件：Access is denied",
+            "无法读取隔离认证状态",
+            "DPAPI 解密失败",
+            "当前 auth.json 不是有效 JSON",
+        ] {
+            let error = UsageQueryError::from(message.to_string());
+            assert_eq!(error.code, "local_io");
+            assert!(!error.reauth_required);
+        }
+        let changed =
+            UsageQueryError::from("查询期间账号已变化，已丢弃本次结果，请重新刷新".to_string());
+        assert_eq!(changed.code, "account_changed");
+        assert!(!changed.reauth_required);
+        assert!(
+            UsageQueryError::from("App Server 请求失败：refresh_token_reused".to_string())
+                .reauth_required
+        );
 
         assert_eq!(
             UsageQueryError::from("App Server 请求超时".to_string()).code,

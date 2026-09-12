@@ -11,6 +11,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageSnapshot {
+    #[serde(default)]
+    pub account_id: String,
     pub account: Option<AccountInfo>,
     pub primary: Option<LimitWindow>,
     pub secondary: Option<LimitWindow>,
@@ -37,10 +39,33 @@ pub struct LimitWindow {
 }
 
 pub async fn query_usage(codex_path: &str, codex_home: &str) -> Result<UsageSnapshot, String> {
-    let mut process = AppServerProcess::start(codex_path, codex_home).await?;
-    let result = process.query().await;
-    process.stop().await;
-    result
+    query_for_home(codex_home, async {
+        let mut process = AppServerProcess::start(codex_path, codex_home).await?;
+        let result = process.query().await;
+        process.stop().await;
+        result
+    })
+    .await
+}
+
+async fn query_for_home(
+    codex_home: &str,
+    query: impl std::future::Future<Output = Result<UsageSnapshot, String>>,
+) -> Result<UsageSnapshot, String> {
+    let before = crate::vault::current_account_id(codex_home)?;
+    let result = query.await;
+    let after = crate::vault::current_account_id(codex_home).ok();
+    verify_query_identity(&before, after.as_deref())?;
+    let mut snapshot = result?;
+    snapshot.account_id = before;
+    Ok(snapshot)
+}
+
+fn verify_query_identity(before: &str, after: Option<&str>) -> Result<(), String> {
+    if Some(before) != after {
+        return Err("查询期间账号已变化，已丢弃本次结果，请重新刷新".into());
+    }
+    Ok(())
 }
 
 struct AppServerProcess {
@@ -57,6 +82,7 @@ impl AppServerProcess {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
+            .kill_on_drop(true)
             .creation_flags_no_window()
             .spawn()
             .map_err(|error| format!("无法启动 Codex App Server：{error}"))?;
@@ -180,6 +206,7 @@ fn to_snapshot(account_result: &Value, usage_result: &Value) -> UsageSnapshot {
         .get("rateLimits")
         .or_else(|| usage_result.get("rate_limits"));
     UsageSnapshot {
+        account_id: String::new(),
         account,
         primary: limits
             .and_then(|value| value.get("primary"))
@@ -254,6 +281,49 @@ impl CommandWindowsExt for Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_usage_when_login_changes_or_disappears_during_query() {
+        assert!(verify_query_identity("account-a", Some("account-a")).is_ok());
+        assert!(verify_query_identity("account-a", Some("account-b")).is_err());
+        assert!(verify_query_identity("account-a", None).is_err());
+    }
+
+    #[test]
+    fn binds_results_to_auth_identity_and_rejects_external_switch() {
+        tauri::async_runtime::block_on(async {
+            let home = std::env::temp_dir().join(format!(
+                "codex-hub-query-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&home).unwrap();
+            let a = br#"{"tokens":{"access_token":"fixture-a","account_id":"account-a"}}"#;
+            let a_refreshed =
+                br#"{"tokens":{"access_token":"fixture-renewed","account_id":"account-a"}}"#;
+            let b = br#"{"tokens":{"access_token":"fixture-b","account_id":"account-b"}}"#;
+            std::fs::write(home.join("auth.json"), a).unwrap();
+            let expected = crate::vault::current_account_id(home.to_str().unwrap()).unwrap();
+            let snapshot = query_for_home(home.to_str().unwrap(), async {
+                std::fs::write(home.join("auth.json"), a_refreshed).unwrap();
+                Ok(to_snapshot(&json!({}), &json!({})))
+            })
+            .await
+            .unwrap();
+            assert_eq!(snapshot.account_id, expected);
+            let result = query_for_home(home.to_str().unwrap(), async {
+                std::fs::write(home.join("auth.json"), b).unwrap();
+                Ok(to_snapshot(&json!({}), &json!({})))
+            })
+            .await;
+            assert!(result.unwrap_err().contains("查询期间账号已变化"));
+            assert_eq!(home.parent(), Some(std::env::temp_dir().as_path()));
+            std::fs::remove_dir_all(home).unwrap();
+        });
+    }
 
     #[test]
     fn parses_camel_case_usage() {
