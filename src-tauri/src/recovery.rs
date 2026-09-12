@@ -95,9 +95,14 @@ fn remove_file(path: &Path) -> Result<(), String> {
 
 pub fn record_child(home: &Path, pid: u32) -> Result<(), String> {
     checked_path(home)?;
+    let record = crate::child_process::Record {
+        version: 1,
+        process: crate::child_process::capture(pid)?,
+        owner: crate::child_process::capture(std::process::id())?,
+    };
     vault::atomic_write(
         &home.join("hub-child.json"),
-        &serde_json::to_vec(&pid).map_err(|_| "无法记录进程")?,
+        &serde_json::to_vec(&record).map_err(|_| "无法记录进程")?,
     )
 }
 
@@ -113,40 +118,51 @@ pub fn ensure_idle(home: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn child_is_running(home: &Path) -> Result<bool, String> {
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ChildRecord {
+    Verified(crate::child_process::Record),
+    Legacy(u32),
+}
+
+fn read_child(home: &Path) -> Result<Option<ChildRecord>, String> {
     let path = home.join("hub-child.json");
     checked_path(&path)?;
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("无法读取遗留进程状态：{error}")),
     };
-    let pid: u32 =
-        serde_json::from_slice(&bytes).map_err(|_| "遗留进程记录损坏，请检查应用数据目录后重试")?;
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Foundation::{
-            CloseHandle, ERROR_INVALID_PARAMETER, GetLastError, WAIT_OBJECT_0,
-        };
-        use windows_sys::Win32::System::Threading::{
-            OpenProcess, SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject,
-        };
-        let process = unsafe { OpenProcess(SYNCHRONIZATION_SYNCHRONIZE, 0, pid) };
-        if process.is_null() {
-            return if unsafe { GetLastError() } == ERROR_INVALID_PARAMETER {
-                Ok(false)
-            } else {
-                Err("无法确认遗留进程是否退出，请关闭相关 Codex 登录/查询进程后重试恢复".into())
-            };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|_| "遗留进程记录损坏，请检查应用数据目录后重试".into())
+}
+
+fn child_is_running(home: &Path) -> Result<bool, String> {
+    match read_child(home)? {
+        None => Ok(false),
+        Some(ChildRecord::Legacy(pid)) => crate::child_process::legacy_running(pid),
+        Some(ChildRecord::Verified(record)) if record.version == 1 => {
+            crate::child_process::running(&record.process)
         }
-        let stopped = unsafe { WaitForSingleObject(process, 0) } == WAIT_OBJECT_0;
-        unsafe { CloseHandle(process) };
-        Ok(!stopped)
+        Some(_) => Err("子进程记录版本不受支持".into()),
     }
-    #[cfg(not(windows))]
-    {
-        let _ = pid;
-        Err("进程恢复检查当前只支持 Windows".into())
+}
+
+// Called only during startup or while the exclusive operation lock is held.
+fn stop_stale_child(home: &Path) -> Result<(), String> {
+    match read_child(home)? {
+        None => Ok(()),
+        Some(ChildRecord::Verified(record)) => crate::child_process::stop(&record),
+        Some(ChildRecord::Legacy(pid)) => {
+            if crate::child_process::legacy_running(pid)? {
+                Err(format!(
+                    "旧版记录只有 PID {pid}，无法安全核验进程身份。请关闭旧登录流程后重试恢复；新版已增加自动回收。"
+                ))
+            } else {
+                Ok(())
+            }
+        }
     }
 }
 
@@ -267,19 +283,6 @@ pub fn run(data_dir: &Path, home: Result<String, String>) -> Report {
             restart_suggested: false,
         };
     }
-    match home {
-        Ok(home) => {
-            if let Err(error) = recover_transaction(data_dir, &home, &mut report) {
-                errors.push(error);
-            }
-            if let Err(error) =
-                remove_file(&Path::new(&home).join(".auth.json.codex-account-hub.tmp"))
-            {
-                errors.push(error);
-            }
-        }
-        Err(error) => errors.push(error),
-    }
     let mut cleaned = 0;
     for (name, runtime) in [("login", false), ("runtime", true)] {
         let root = data_dir.join(name);
@@ -299,6 +302,7 @@ pub fn run(data_dir: &Path, home: Result<String, String>) -> Report {
             let result = entry.map_err(|error| error.to_string()).and_then(|entry| {
                 checked_path(&entry.path())?;
                 if entry.path().is_dir() {
+                    stop_stale_child(&entry.path())?;
                     cleanup_home(&entry.path(), data_dir, runtime)
                 } else {
                     Ok(0)
@@ -309,6 +313,20 @@ pub fn run(data_dir: &Path, home: Result<String, String>) -> Report {
                 Err(error) => errors.push(error),
             }
         }
+    }
+    // Settle old queries before the journal imports the authoritative active credentials.
+    match home {
+        Ok(home) => {
+            if let Err(error) = recover_transaction(data_dir, &home, &mut report) {
+                errors.push(error);
+            }
+            if let Err(error) =
+                remove_file(&Path::new(&home).join(".auth.json.codex-account-hub.tmp"))
+            {
+                errors.push(error);
+            }
+        }
+        Err(error) => errors.push(error),
     }
     if cleaned > 0 {
         report
@@ -491,6 +509,49 @@ mod tests {
         fs::remove_dir(blocked).unwrap();
         assert!(!fixture.report().needs_attention);
         assert_eq!(fixture.active(), OLD);
+    }
+
+    #[test]
+    fn retry_recovery_stops_verified_child_and_cleans_legacy_dead_marker() {
+        tauri::async_runtime::block_on(async {
+            let fixture = Fixture::new();
+            let home = fixture.root.join("login").join("abandoned");
+            fs::create_dir_all(&home).unwrap();
+            fs::write(home.join("auth.json"), TARGET).unwrap();
+            let mut child = tokio::process::Command::new("powershell.exe")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "Start-Sleep -Seconds 30",
+                ])
+                .creation_flags(0x08000000)
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let pid = child.id().unwrap();
+            // Legacy live PID must not be terminated without reliable identity metadata.
+            fs::write(
+                home.join("hub-child.json"),
+                serde_json::to_vec(&pid).unwrap(),
+            )
+            .unwrap();
+            assert!(fixture.report().needs_attention);
+            assert!(child.try_wait().unwrap().is_none());
+            record_child(&home, pid).unwrap();
+            assert!(!fixture.report().needs_attention);
+            assert!(child.try_wait().unwrap().is_some());
+            assert!(!home.join("auth.json").exists());
+            assert!(!home.join("hub-child.json").exists());
+            fs::write(
+                home.join("hub-child.json"),
+                serde_json::to_vec(&pid).unwrap(),
+            )
+            .unwrap();
+            assert!(!fixture.report().needs_attention);
+            assert!(!home.join("hub-child.json").exists());
+            assert_eq!(fixture.active(), OLD);
+        });
     }
 
     #[test]

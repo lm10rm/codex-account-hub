@@ -89,6 +89,7 @@ fn verify_query_identity(before: &str, after: Option<&str>) -> Result<(), String
 }
 
 struct AppServerProcess {
+    _job: crate::child_process::ChildJob,
     child: Child,
     stdin: tokio::process::ChildStdin,
     lines: Lines<BufReader<ChildStdout>>,
@@ -107,6 +108,15 @@ impl AppServerProcess {
             .spawn()
             .map_err(|error| format!("无法启动 Codex App Server：{error}"))?;
 
+        let job = match crate::child_process::ChildJob::attach(child.id().ok_or("查询进程已退出")?)
+        {
+            Ok(job) => job,
+            Err(error) => {
+                let _ = child.kill().await;
+                return Err(error);
+            }
+        };
+
         let stdin = child
             .stdin
             .take()
@@ -117,6 +127,7 @@ impl AppServerProcess {
             .ok_or_else(|| "无法连接 App Server stdout".to_string())?;
 
         Ok(Self {
+            _job: job,
             child,
             stdin,
             lines: BufReader::new(stdout).lines(),

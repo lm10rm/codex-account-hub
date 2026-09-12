@@ -51,6 +51,8 @@ Rust 测试中有一项真实 Codex 进程检测测试默认忽略，避免测�
 
 0.7 的故障测试还覆盖事务中断、加密写回失败后的重试、遗留进程保护、登录取消与超时。子进程测试仅启动隐藏的测试 PowerShell 等待进程，不执行真实 Codex 登录或重启。界面回归覆盖取消后解锁、保存阶段禁止取消、启动恢复提示和重启重试不重复切换。
 
+0.7.2 额外启动测试父进程并强制终止，验证 Job Object 能回收直接子进程且不影响无关进程；覆盖 PID 创建时间/路径不匹配、其他管理器仍存活、结束已核验残留进程，以及旧版 PID 记录兼容。
+
 另有生产前端的浏览器回归测试，使用虚拟 Tauri IPC 和假数据，不启动真实 Tauri 或读取用户认证：
 
 ```powershell
@@ -103,6 +105,7 @@ src-tauri/src/
   vault.rs                DPAPI 账号保险库与安全切换
   login.rs                登录生命周期与取消
   recovery.rs             加密事务及临时认证恢复
+  child_process.rs        Windows 子进程托管和身份核验
   codex_desktop.rs        Codex 桌面进程关闭与重启
   lib.rs                  Tauri commands 与操作互斥
 ```

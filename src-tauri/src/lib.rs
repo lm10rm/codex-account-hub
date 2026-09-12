@@ -1,4 +1,5 @@
 mod app_server;
+mod child_process;
 mod codex_desktop;
 mod login;
 mod recovery;
@@ -41,7 +42,10 @@ async fn retry_recovery(
         .path()
         .app_data_dir()
         .map_err(|error| error.to_string())?;
-    let report = recovery::run(&data_dir, runtime::codex_home());
+    let home = runtime::codex_home();
+    let report = tokio::task::spawn_blocking(move || recovery::run(&data_dir, home))
+        .await
+        .map_err(|_| "恢复任务异常，请重试恢复".to_string())?;
     *state.0.lock().map_err(|_| "恢复状态不可用")? = report.clone();
     Ok(report)
 }
@@ -588,6 +592,14 @@ async fn run_interactive_login(
     let mut child = command
         .spawn()
         .map_err(|error| format!("无法启动 Codex 官方登录：{error}"))?;
+
+    let _job = match child_process::ChildJob::attach(child.id().ok_or("登录进程已退出")?) {
+        Ok(job) => job,
+        Err(error) => {
+            let _ = child.kill().await;
+            return Err(error);
+        }
+    };
 
     if let Err(error) = recovery::record_child(login_home, child.id().ok_or("登录进程已退出")?)
     {
